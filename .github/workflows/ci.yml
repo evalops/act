@@ -15,5 +15,6 @@ jobs:
         with:
           components: clippy
       - run: cargo build --verbose
+      - run: cargo fmt --all -- --check
       - run: cargo test --verbose
       - run: cargo clippy --all-targets -- -D warnings
