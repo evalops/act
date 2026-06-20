@@ -80,6 +80,15 @@ fn check_fn(d: &FnDecl, tools: &[ToolDeclInfo], diags: &mut Vec<Diagnostic>) {
     let body = d.body.as_ref().unwrap();
     check_block(body, &d.effects, diags);
 
+    // Rule: secret taint — track Secret<T> variables, reject them in model inputs.
+    let mut taint_set = collect_tainted_vars(body);
+    for param in &d.params {
+        if type_contains_secret(&param.ty.node) {
+            taint_set.insert(param.name.node.clone());
+        }
+    }
+    check_taint(body, &taint_set, diags);
+
     // Rule 4: policy_expect vs needs cross-check.
     check_policy_vs_needs(d, diags);
 
@@ -288,7 +297,7 @@ fn check_expr(e: &Spanned<Expr>, declared: &[Spanned<EffectRef>], diags: &mut Ve
             if let Expr::Path(path) = &callee.node {
                 if path.len() >= 2 {
                     let _effect = format!("{}.{}", path[0].node, "write".to_string()); // simplified
-                                                                                      // Heuristic: if the tool path ends with create_/update_/delete_/close_/merge_/push_ etc -> write; else read.
+                                                                                       // Heuristic: if the tool path ends with create_/update_/delete_/close_/merge_/push_ etc -> write; else read.
                     let last = path.last().unwrap().node.as_str();
                     let access = if is_write_name(last) { "write" } else { "read" };
                     let required = format!("{}.{}", path[0].node, access);
@@ -780,6 +789,212 @@ fn check_compensation_expr(
                     }
                 }
                 _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+// =====================================================================
+// Secret taint checking: Secret<T> values cannot flow into model inputs
+// =====================================================================
+
+/// Collect the set of variable names that have a Secret<T> type annotation.
+fn collect_tainted_vars(block: &Block) -> std::collections::HashSet<String> {
+    let mut tainted = std::collections::HashSet::new();
+    for stmt in block {
+        match &stmt.node {
+            Stmt::Let { name, ty, .. } | Stmt::Var { name, ty, .. } => {
+                if let Some(t) = ty {
+                    if type_contains_secret(&t.node) {
+                        tainted.insert(name.node.clone());
+                    }
+                }
+            }
+            Stmt::If { then, else_, .. } => {
+                tainted.extend(collect_tainted_vars(then));
+                if let Some(e) = else_ {
+                    tainted.extend(collect_tainted_vars(e));
+                }
+            }
+            Stmt::For { body, .. } | Stmt::While { body, .. } => {
+                tainted.extend(collect_tainted_vars(body));
+            }
+            _ => {}
+        }
+    }
+    tainted
+}
+
+/// Check if a type references Secret<T>.
+fn type_contains_secret(ty: &Ty) -> bool {
+    match ty {
+        Ty::Named { path, args } => {
+            let name = path.last().map(|i| i.node.as_str()).unwrap_or("");
+            name == "Secret" && !args.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Walk expressions and check for secret leaks into model calls.
+fn check_taint(
+    block: &Block,
+    tainted: &std::collections::HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for stmt in block {
+        match &stmt.node {
+            Stmt::Let { init, .. } | Stmt::Var { init, .. } => {
+                check_taint_expr(init, tainted, diags);
+            }
+            Stmt::Expr(e) => check_taint_expr(e, tainted, diags),
+            Stmt::Return(e) => {
+                if let Some(e) = e {
+                    check_taint_expr(e, tainted, diags);
+                }
+            }
+            Stmt::If { then, else_, .. } => {
+                check_taint(then, tainted, diags);
+                if let Some(e) = else_ {
+                    check_taint(e, tainted, diags);
+                }
+            }
+            Stmt::For { body, .. } | Stmt::While { body, .. } => {
+                check_taint(body, tainted, diags);
+            }
+            Stmt::Match { arms, .. } => {
+                for arm in arms {
+                    check_taint(&arm.body, tainted, diags);
+                }
+            }
+            Stmt::Check { cond, else_block } => {
+                check_taint_expr(cond, tainted, diags);
+                if let Some(b) = else_block {
+                    check_taint(b, tainted, diags);
+                }
+            }
+            Stmt::Require(e) | Stmt::Ensure(e) => {
+                check_taint_expr(e, tainted, diags);
+            }
+            Stmt::Trace { fields, .. } => {
+                for (_, v) in fields {
+                    check_taint_expr(v, tainted, diags);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_taint_expr(
+    e: &Spanned<Expr>,
+    tainted: &std::collections::HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match &e.node {
+        Expr::Infer { spec, .. } => {
+            if let Some(input) = &spec.input {
+                let leaked = find_tainted_refs(input, tainted);
+                if !leaked.is_empty() {
+                    diags.push(
+                    Diagnostic::new(
+                        codes::E_SECRET_LEAK,
+                        Severity::Error,
+                        e.span,
+                        format!(
+                            "Secret-tainted variable `{}` flows into a model `infer` input. \
+                             Redact it before passing to the model, or use Public<T>.",
+                            leaked.join("`, `")
+                        ),
+                    )
+                    .with_note("Use a redact() function to convert Secret<T> to Public<T> before model input."),
+                );
+                }
+            }
+            // Also check sub-expressions in the spec
+            for c in &spec.constraints {
+                check_taint_expr(c, tainted, diags);
+            }
+        }
+        Expr::Call { callee, args } => {
+            for a in args {
+                check_taint_expr(&a.value, tainted, diags);
+            }
+            // Don't recurse into callee for taint — only data args matter
+            let _ = callee;
+        }
+        Expr::Bin { lhs, rhs, .. } => {
+            check_taint_expr(lhs, tainted, diags);
+            check_taint_expr(rhs, tainted, diags);
+        }
+        Expr::Field { receiver, .. } => check_taint_expr(receiver, tainted, diags),
+        Expr::Method { receiver, args, .. } => {
+            check_taint_expr(receiver, tainted, diags);
+            for a in args {
+                check_taint_expr(&a.value, tainted, diags);
+            }
+        }
+        Expr::Await(_, body) => match &body.node {
+            AwaitBody::All(branches) => {
+                for (_, e) in branches {
+                    check_taint_expr(e, tainted, diags);
+                }
+            }
+            _ => {}
+        },
+        Expr::Record(fields) => {
+            for (_, v) in fields {
+                check_taint_expr(v, tainted, diags);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Find all tainted variable names referenced in an expression.
+fn find_tainted_refs(
+    e: &Spanned<Expr>,
+    tainted: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    collect_tainted_refs(e, tainted, &mut found);
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn collect_tainted_refs(
+    e: &Spanned<Expr>,
+    tainted: &std::collections::HashSet<String>,
+    found: &mut Vec<String>,
+) {
+    match &e.node {
+        Expr::Path(p) => {
+            if p.len() == 1 && tainted.contains(&p[0].node) {
+                found.push(p[0].node.clone());
+            }
+        }
+        Expr::Field { receiver, .. } => collect_tainted_refs(receiver, tainted, found),
+        Expr::Record(fields) => {
+            for (_, v) in fields {
+                collect_tainted_refs(v, tainted, found);
+            }
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                collect_tainted_refs(&a.value, tainted, found);
+            }
+        }
+        Expr::Bin { lhs, rhs, .. } => {
+            collect_tainted_refs(lhs, tainted, found);
+            collect_tainted_refs(rhs, tainted, found);
+        }
+        Expr::Interp(parts) | Expr::Markdown(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(e) = p {
+                    collect_tainted_refs(e, tainted, found);
+                }
             }
         }
         _ => {}

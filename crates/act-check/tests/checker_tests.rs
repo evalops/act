@@ -380,3 +380,167 @@ proc fetch(repo: Repo) -> Result<String, Err>
         diags
     );
 }
+
+// =====================================================================
+// Secret taint tests
+// =====================================================================
+
+#[test]
+fn test_secret_leak_into_model() {
+    let src = r#"
+module test@0.1
+use model codegen@1 as coder
+
+type Summary = {
+  text: String,
+}
+
+task leak(token: Secret<String>) -> Summary
+  effects [model]
+{
+  let summary = infer Summary using coder {
+    goal: "Summarize."
+    input: token
+  } accept {
+    confidence >= 0.50
+  }
+  return ok(summary)
+}
+"#;
+    let diags = check_src(src);
+    assert!(has_error(&diags, codes::E_SECRET_LEAK));
+}
+
+#[test]
+fn test_secret_leak_in_record() {
+    let src = r#"
+module test@0.1
+use model codegen@1 as coder
+
+type Summary = {
+  text: String,
+}
+
+task leak(key: Secret<String>) -> Summary
+  effects [model]
+{
+  let summary = infer Summary using coder {
+    goal: "Summarize."
+    input: {
+      token: key,
+      data: "safe",
+    }
+  } accept {
+    confidence >= 0.50
+  }
+  return ok(summary)
+}
+"#;
+    let diags = check_src(src);
+    assert!(has_error(&diags, codes::E_SECRET_LEAK));
+}
+
+#[test]
+fn test_no_secret_leak() {
+    let src = r#"
+module test@0.1
+use model codegen@1 as coder
+
+type Summary = {
+  text: String,
+}
+
+task safe(data: String) -> Summary
+  effects [model]
+{
+  let summary = infer Summary using coder {
+    goal: "Summarize."
+    input: data
+  } accept {
+    confidence >= 0.50
+  }
+  return ok(summary)
+}
+"#;
+    let diags = check_src(src);
+    assert!(!has_error(&diags, codes::E_SECRET_LEAK));
+}
+
+#[test]
+fn test_secret_in_function_param() {
+    let src = r#"
+module test@0.1
+use model codegen@1 as coder
+
+type Analysis = {
+  result: String,
+}
+
+task analyze(token: Secret<String>) -> Analysis
+  effects [model]
+{
+  let safe_token: Public<String> = redact(token)
+  let analysis = infer Analysis using coder {
+    goal: "Analyze."
+    input: safe_token
+  } accept {
+    confidence >= 0.50
+  }
+  return ok(analysis)
+}
+"#;
+    let diags = check_src(src);
+    // safe_token is Public<String>, not Secret<String> — no leak.
+    assert!(!has_error(&diags, codes::E_SECRET_LEAK));
+}
+
+// =====================================================================
+// Lowering / IR tests
+// =====================================================================
+
+#[test]
+fn test_lower_clean_module() {
+    let src = r#"
+module test@0.1
+use tool github@2 as gh
+
+type Repo = { name: String }
+
+task fetch(repo: Repo) -> String
+  effects [gh.read]
+{
+  let result = gh.get_file(repo: repo, path: "README.md")
+  return ok(result)
+}
+"#;
+    let module = parse_module(src, 1).expect("parse should succeed");
+    let out = act_ir::lower(&module);
+    assert!(out.graph.is_some());
+    assert!(out.report.ok);
+}
+
+#[test]
+fn test_lower_parallel_all() {
+    let src = r#"
+module test@0.1
+use tool github@2 as gh
+
+task parallel(repo: String) -> String
+  effects [gh.read]
+{
+  let results = await all {
+    a: gh.get_file(repo: repo, path: "a"),
+    b: gh.get_file(repo: repo, path: "b"),
+  }
+  return ok(results)
+}
+"#;
+    let module = parse_module(src, 1).expect("parse should succeed");
+    let out = act_ir::lower(&module);
+    let graph = out.graph.expect("graph should exist");
+    // Should contain a ParallelAll node.
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|n| n.kind == act_ir::NodeKind::ParallelAll));
+}
