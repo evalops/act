@@ -610,3 +610,63 @@ task put(key: String, value: String) -> String
     assert!(!has_error(&diags, codes::E_STATE_UPDATE_UNGUARDED));
     assert!(!has_error(&diags, codes::E_EFFECT_MISSING));
 }
+
+// =====================================================================
+// Eval / replay tests
+// =====================================================================
+
+#[test]
+fn test_replay_without_trace() {
+    let src = r#"
+module test@0.1
+
+task run(input: String) -> String {
+  return ok(input)
+}
+
+eval "replays_missing_trace" {
+  let r = replay trace("never_recorded")
+  require r != ""
+}
+"#;
+    let diags = check_src(src);
+    assert!(has_error(&diags, codes::E_REPLAY_WITHOUT_TRACE));
+}
+
+#[test]
+fn test_replay_with_trace_ok() {
+    let src = r#"
+module test@0.1
+
+task run(input: String) -> String {
+  trace "root_cause" {
+    claim: "off by one",
+  }
+  return ok(input)
+}
+
+eval "replays_recorded_trace" {
+  let r = replay trace("root_cause")
+  require r != ""
+}
+"#;
+    let diags = check_src(src);
+    assert!(!has_error(&diags, codes::E_REPLAY_WITHOUT_TRACE));
+}
+
+#[test]
+fn test_replay_dynamic_label_not_flagged() {
+    // A non-string-literal label can't be resolved statically; the checker
+    // must not false-positive on it.
+    let src = r#"
+module test@0.1
+
+eval "dynamic" {
+  let label = "x"
+  let r = replay trace(label)
+  require r != ""
+}
+"#;
+    let diags = check_src(src);
+    assert!(!has_error(&diags, codes::E_REPLAY_WITHOUT_TRACE));
+}

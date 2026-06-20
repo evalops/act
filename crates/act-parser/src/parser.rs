@@ -897,7 +897,12 @@ impl Parser {
 
     fn parse_test(&mut self, _eval: bool) -> ParseResult<TestBlock> {
         let start = self.bump().unwrap().span; // test or eval
-        let label = self.ident()?;
+        let label = if self.at(TokenKind::String) {
+            let t = self.bump().unwrap();
+            Ident::new(self.span(&t), t.text)
+        } else {
+            self.ident()?
+        };
         self.expect(TokenKind::LBrace, "`{`")?;
         let body = self.parse_block()?;
         let end = self.expect(TokenKind::RBrace, "`}`")?.span;
@@ -1637,6 +1642,7 @@ impl Parser {
             Some(TokenKind::KwInfer) => self.parse_infer(start),
             Some(TokenKind::KwDecide) => self.parse_decide(start),
             Some(TokenKind::KwSpawn) => self.parse_spawn(start),
+            Some(TokenKind::KwReplay) => self.parse_replay(start),
             Some(TokenKind::QuestionQuestion) => {
                 self.bump();
                 let hole = if self.eat(TokenKind::LBrace) {
@@ -2065,6 +2071,21 @@ impl Parser {
                 score_by,
                 require,
                 else_,
+            },
+        ))
+    }
+
+    fn parse_replay(&mut self, start: LexSpan) -> ParseResult<Spanned<Expr>> {
+        self.bump(); // replay
+        self.expect(TokenKind::KwTrace, "`trace`")?;
+        self.expect(TokenKind::LParen, "`(`")?;
+        let label = self.parse_expr()?;
+        self.expect(TokenKind::RParen, "`)`")?;
+        let span = self.span_from(start, self.peek().map(|t| t.span).unwrap_or(start));
+        Ok(Spanned::new(
+            span,
+            Expr::Replay {
+                label: Box::new(label),
             },
         ))
     }

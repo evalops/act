@@ -905,6 +905,11 @@ impl Formatter {
                 budget,
             } => self.spawn(agent, args, caps, budget.as_ref(), ind),
             Expr::Hole(h) => self.hole(h, ind),
+            Expr::Replay { label } => {
+                self.s("replay trace(");
+                self.expr(&label.node, 0, ind);
+                self.s(")");
+            }
             // Bin/Un are handled by expr(); keep arms for exhaustiveness.
             Expr::Bin { .. } | Expr::Un { .. } => unreachable!("handled by expr()"),
         }

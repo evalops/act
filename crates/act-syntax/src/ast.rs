@@ -531,6 +531,8 @@ pub enum Expr {
     Block(Block),
     /// `all { ... }` desugars to await-less parallel record; kept for await target
     ParallelRecord(Vec<(Ident, Spanned<Expr>)>),
+    /// `replay trace("label")` — re-runs a recorded trace for deterministic tests.
+    Replay { label: Box<Spanned<Expr>> },
 }
 
 #[derive(Clone, Debug)]

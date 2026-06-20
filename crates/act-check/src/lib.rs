@@ -42,6 +42,9 @@ pub fn check(module: &Module) -> CheckOutput {
         }
     }
 
+    // Replay rule: every `replay trace("X")` must reference a recorded `trace`.
+    check_replay(module, &mut diags);
+
     CheckOutput {
         report: DiagnosticReport::new(diags),
         declared_effects: declared,
@@ -71,6 +74,240 @@ fn path_string(p: &[Ident]) -> String {
         .map(|i| i.node.as_str())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+// =====================================================================
+// Replay / trace rule: every `replay trace("X")` must reference a
+// `trace "X"` recorded somewhere in the module. Replays of unrecorded
+// traces are non-deterministic and cannot be asserted against.
+// =====================================================================
+
+fn check_replay(module: &Module, diags: &mut Vec<Diagnostic>) {
+    use std::collections::HashSet;
+    let mut labels: HashSet<String> = HashSet::new();
+    for item in &module.items {
+        for_each_block(item, |b| collect_trace_labels(b, &mut labels));
+    }
+    for item in &module.items {
+        for_each_block(item, |b| check_replay_block(b, &labels, diags));
+    }
+}
+
+/// Apply `f` to every body block in an item (recursing into agent handlers).
+fn for_each_block(item: &Item, mut f: impl FnMut(&Block)) {
+    match item {
+        Item::Fn(d) | Item::Proc(d) | Item::Task(d) => {
+            if let Some(b) = &d.body {
+                f(b);
+            }
+        }
+        Item::Agent(a) => {
+            for h in &a.handlers {
+                f(&h.body);
+            }
+        }
+        Item::Test(t) | Item::Eval(t) => f(&t.body),
+        _ => {}
+    }
+}
+
+fn collect_trace_labels(block: &Block, set: &mut std::collections::HashSet<String>) {
+    for s in block {
+        match &s.node {
+            Stmt::Trace { label, fields } => {
+                set.insert(label.node.clone());
+                for (_, v) in fields {
+                    collect_trace_expr(v, set);
+                }
+            }
+            Stmt::If {
+                then,
+                else_: Some(e),
+                ..
+            } => {
+                collect_trace_labels(then, set);
+                collect_trace_labels(e, set);
+            }
+            Stmt::For { body, .. } | Stmt::While { body, .. } => collect_trace_labels(body, set),
+            Stmt::Match { arms, .. } => {
+                for a in arms {
+                    collect_trace_labels(&a.body, set);
+                }
+            }
+            Stmt::Recover { body, .. } | Stmt::Defer { body, .. } => {
+                collect_trace_labels(body, set)
+            }
+            Stmt::Check {
+                else_block: Some(e),
+                ..
+            } => collect_trace_labels(e, set),
+            _ => {}
+        }
+    }
+}
+
+fn collect_trace_expr(e: &Spanned<Expr>, set: &mut std::collections::HashSet<String>) {
+    match &e.node {
+        Expr::Call { callee, args } => {
+            collect_trace_expr(callee, set);
+            for a in args {
+                collect_trace_expr(&a.value, set);
+            }
+        }
+        Expr::Record(fields) | Expr::ParallelRecord(fields) => {
+            for (_, v) in fields {
+                collect_trace_expr(v, set);
+            }
+        }
+        Expr::Block(b) => collect_trace_labels(b, set),
+        _ => {}
+    }
+}
+
+fn check_replay_block(
+    block: &Block,
+    labels: &std::collections::HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for s in block {
+        check_replay_stmt(&s.node, labels, diags);
+    }
+}
+
+fn check_replay_stmt(
+    stmt: &Stmt,
+    labels: &std::collections::HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match stmt {
+        Stmt::Let { init, .. } | Stmt::Var { init, .. } => check_replay_expr(init, labels, diags),
+        Stmt::Assign { target, value } => {
+            check_replay_expr(target, labels, diags);
+            check_replay_expr(value, labels, diags);
+        }
+        Stmt::Expr(e) => check_replay_expr(e, labels, diags),
+        Stmt::Return(e) => {
+            if let Some(e) = e {
+                check_replay_expr(e, labels, diags);
+            }
+        }
+        Stmt::If {
+            cond, then, else_, ..
+        } => {
+            check_replay_expr(cond, labels, diags);
+            check_replay_block(then, labels, diags);
+            if let Some(e) = else_ {
+                check_replay_block(e, labels, diags);
+            }
+        }
+        Stmt::For { iter, body, .. } => {
+            check_replay_expr(iter, labels, diags);
+            check_replay_block(body, labels, diags);
+        }
+        Stmt::While { cond, body, .. } => {
+            check_replay_expr(cond, labels, diags);
+            check_replay_block(body, labels, diags);
+        }
+        Stmt::Match {
+            scrutinee, arms, ..
+        } => {
+            check_replay_expr(scrutinee, labels, diags);
+            for a in arms {
+                check_replay_block(&a.body, labels, diags);
+            }
+        }
+        Stmt::Recover { from, body, .. } => {
+            check_replay_expr(from, labels, diags);
+            check_replay_block(body, labels, diags);
+        }
+        Stmt::Defer { body, .. } => check_replay_block(body, labels, diags),
+        Stmt::Require(e) | Stmt::Ensure(e) => check_replay_expr(e, labels, diags),
+        Stmt::Check {
+            cond, else_block, ..
+        } => {
+            check_replay_expr(cond, labels, diags);
+            if let Some(e) = else_block {
+                check_replay_block(e, labels, diags);
+            }
+        }
+        Stmt::Trace { fields, .. } => {
+            for (_, v) in fields {
+                check_replay_expr(v, labels, diags);
+            }
+        }
+        Stmt::Checkpoint { body, require, .. } => {
+            check_replay_expr(body, labels, diags);
+            if let Some(r) = require {
+                check_replay_expr(r, labels, diags);
+            }
+        }
+        Stmt::Invariant { require, .. } => check_replay_expr(require, labels, diags),
+    }
+}
+
+fn check_replay_expr(
+    e: &Spanned<Expr>,
+    labels: &std::collections::HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match &e.node {
+        Expr::Replay { label } => {
+            if let Expr::Lit(Literal::String(s)) = &label.node {
+                if !labels.contains(s) {
+                    diags.push(
+                        Diagnostic::new(
+                            codes::E_REPLAY_WITHOUT_TRACE,
+                            Severity::Error,
+                            e.span,
+                            format!(
+                                "`replay trace(\"{}\")` references a trace that is never recorded \
+                                 with `trace \"{}\" {{ ... }}` in this module.",
+                                s, s
+                            ),
+                        )
+                        .with_note(
+                            "Record the trace in the task under test, or fix the label to match an \
+                             existing `trace` statement.",
+                        ),
+                    );
+                }
+            }
+        }
+        Expr::Call { callee, args } => {
+            check_replay_expr(callee, labels, diags);
+            for a in args {
+                check_replay_expr(&a.value, labels, diags);
+            }
+        }
+        Expr::Method { receiver, args, .. } => {
+            check_replay_expr(receiver, labels, diags);
+            for a in args {
+                check_replay_expr(&a.value, labels, diags);
+            }
+        }
+        Expr::Field { receiver, .. } => check_replay_expr(receiver, labels, diags),
+        Expr::Index { receiver, index } => {
+            check_replay_expr(receiver, labels, diags);
+            check_replay_expr(index, labels, diags);
+        }
+        Expr::Bin { lhs, rhs, .. } => {
+            check_replay_expr(lhs, labels, diags);
+            check_replay_expr(rhs, labels, diags);
+        }
+        Expr::Un { expr, .. } | Expr::Try(expr) => check_replay_expr(expr, labels, diags),
+        Expr::Record(fields) | Expr::ParallelRecord(fields) => {
+            for (_, v) in fields {
+                check_replay_expr(v, labels, diags);
+            }
+        }
+        Expr::Array(elems) => {
+            for e in elems {
+                check_replay_expr(e, labels, diags);
+            }
+        }
+        Expr::Block(b) => check_replay_block(b, labels, diags),
+        _ => {}
+    }
 }
 
 fn check_fn(d: &FnDecl, tools: &[ToolDeclInfo], diags: &mut Vec<Diagnostic>) {
@@ -254,6 +491,7 @@ fn expr_has_effect(e: &Spanned<Expr>) -> bool {
         Expr::ResultCtor { value, .. } => value.as_ref().is_some_and(|v| expr_has_effect(v)),
         Expr::Spawn { .. } => true,
         Expr::Hole(_) => false,
+        Expr::Replay { .. } => false,
         Expr::Record(fields) => fields.iter().any(|(_, v)| expr_has_effect(v)),
         Expr::Array(elems) => elems.iter().any(expr_has_effect),
         Expr::Block(b) => block_has_effect(b),
@@ -462,6 +700,7 @@ fn check_expr(e: &Spanned<Expr>, declared: &[Spanned<EffectRef>], diags: &mut Ve
                 }
             }
         }
+        Expr::Replay { label } => check_expr(label, declared, diags),
         Expr::Lit(_) | Expr::Path(_) => {}
     }
 }

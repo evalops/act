@@ -214,3 +214,29 @@ task work(token: Secret<String>) -> Out
 "#,
     );
 }
+
+#[test]
+fn idempotent_state_and_replay() {
+    assert_idempotent(
+        r#"
+module test@0.1
+
+task run(input: String) -> String
+  effects [state]
+{
+  trace "root_cause" {
+    claim: "off by one",
+  }
+  let cell = state.read(key: input)
+  let v = 1
+  state.update(key: input, expected_version: v, value: cell.value)
+  return ok(input)
+}
+
+eval "replays" {
+  let r = replay trace("root_cause")
+  require r != ""
+}
+"#,
+    );
+}

@@ -42,6 +42,7 @@ pub enum NodeKind {
     Literal,
     Hole,
     Pure,
+    Replay,
 }
 
 pub struct LowerOutput {
@@ -458,6 +459,17 @@ fn lower_expr(
                 id,
                 kind: NodeKind::Pure,
                 children: vec![],
+                span: e.span,
+            });
+            id
+        }
+        Expr::Replay { label } => {
+            let c = lower_expr(label, nodes, next, diags);
+            let id = fresh(next);
+            nodes.push(GraphNode {
+                id,
+                kind: NodeKind::Replay,
+                children: vec![c],
                 span: e.span,
             });
             id
