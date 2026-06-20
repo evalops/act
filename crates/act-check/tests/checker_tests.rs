@@ -12,10 +12,6 @@ fn check_src(src: &str) -> Vec<(String, Severity)> {
         .collect()
 }
 
-fn has_diag(diags: &[(String, Severity)], code: &str) -> bool {
-    diags.iter().any(|(c, _)| c == code)
-}
-
 fn has_error(diags: &[(String, Severity)], code: &str) -> bool {
     diags
         .iter()

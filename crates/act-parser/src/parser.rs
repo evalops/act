@@ -67,12 +67,16 @@ impl SpanLike for Span {
 pub struct Parser {
     toks: Vec<Token>,
     idx: usize,
-    file: u32,
+    _file: u32,
 }
 
 impl Parser {
     pub fn new(toks: Vec<Token>, file: u32) -> Parser {
-        Parser { toks, idx: 0, file }
+        Parser {
+            toks,
+            idx: 0,
+            _file: file,
+        }
     }
 
     fn span(&self, t: &Token) -> Span {
