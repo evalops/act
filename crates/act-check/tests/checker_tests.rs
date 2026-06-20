@@ -525,7 +525,7 @@ fn test_lower_parallel_all() {
 module test@0.1
 use tool github@2 as gh
 
-task parallel(repo: String) -> String
+task parallel_fetch(repo: String) -> String
   effects [gh.read]
 {
   let results = await all {
