@@ -540,3 +540,73 @@ task parallel_fetch(repo: String) -> String
         .iter()
         .any(|n| n.kind == act_ir::NodeKind::ParallelAll));
 }
+
+// =====================================================================
+// Durable state cell tests
+// =====================================================================
+
+#[test]
+fn test_state_read_requires_effect() {
+    let src = r#"
+module test@0.1
+
+task get(key: String) -> String {
+  let cell = state.read(key: key)
+  return ok(cell.value)
+}
+"#;
+    let diags = check_src(src);
+    assert!(has_error(&diags, codes::E_EFFECT_MISSING));
+    assert!(!has_error(&diags, codes::E_STATE_UPDATE_UNGUARDED));
+}
+
+#[test]
+fn test_state_read_ok() {
+    let src = r#"
+module test@0.1
+
+task get(key: String) -> String
+  effects [state]
+{
+  let cell = state.read(key: key)
+  return ok(cell.value)
+}
+"#;
+    let diags = check_src(src);
+    assert!(!has_error(&diags, codes::E_EFFECT_MISSING));
+    assert!(!has_error(&diags, codes::E_STATE_UPDATE_UNGUARDED));
+}
+
+#[test]
+fn test_state_update_unguarded() {
+    let src = r#"
+module test@0.1
+
+task put(key: String, value: String) -> String
+  effects [state]
+{
+  let cell = state.update(key: key, value: value)
+  return ok(cell.value)
+}
+"#;
+    let diags = check_src(src);
+    assert!(has_error(&diags, codes::E_STATE_UPDATE_UNGUARDED));
+}
+
+#[test]
+fn test_state_update_guarded_ok() {
+    let src = r#"
+module test@0.1
+
+task put(key: String, value: String) -> String
+  effects [state]
+{
+  let v = 3
+  let cell = state.update(key: key, expected_version: v, value: value)
+  return ok(cell.value)
+}
+"#;
+    let diags = check_src(src);
+    assert!(!has_error(&diags, codes::E_STATE_UPDATE_UNGUARDED));
+    assert!(!has_error(&diags, codes::E_EFFECT_MISSING));
+}

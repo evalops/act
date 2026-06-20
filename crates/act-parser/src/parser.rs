@@ -109,6 +109,14 @@ impl Parser {
         self.peek_kind() == Some(k)
     }
 
+    /// True if the current token starts a named label: an identifier or soft
+    /// keyword immediately followed by `:`. Used for call args (`name: value`)
+    /// and record fields, so soft keywords like `value` work as names.
+    fn at_named_label(&self) -> bool {
+        let is_name = self.at(TokenKind::Ident) || self.peek_kind().is_some_and(is_soft_keyword);
+        is_name && self.peek2().map(|t| t.kind) == Some(TokenKind::Colon)
+    }
+
     fn eat(&mut self, k: TokenKind) -> bool {
         if self.at(k) {
             self.bump();
@@ -1503,9 +1511,7 @@ impl Parser {
         while !self.at(TokenKind::RParen) && self.peek().is_some() {
             let astart = self.peek().map(|t| t.span).unwrap_or(LexSpan::dummy());
             // named arg? `name: value`
-            let name = if self.at(TokenKind::Ident)
-                && self.peek2().map(|t| t.kind) == Some(TokenKind::Colon)
-            {
+            let name = if self.at_named_label() {
                 Some(self.ident()?)
             } else {
                 None
@@ -1690,9 +1696,7 @@ impl Parser {
                     return Ok(Spanned::new(span, Expr::Record(Vec::new())));
                 }
                 // peek for ident:
-                if self.at(TokenKind::Ident)
-                    && self.peek2().map(|t| t.kind) == Some(TokenKind::Colon)
-                {
+                if self.at_named_label() {
                     let mut fields = Vec::new();
                     while !self.at(TokenKind::RBrace) {
                         let name = self.ident()?;

@@ -293,37 +293,21 @@ impl EffectCallee for Spanned<Expr> {
 fn check_expr(e: &Spanned<Expr>, declared: &[Spanned<EffectRef>], diags: &mut Vec<Diagnostic>) {
     match &e.node {
         Expr::Call { callee, args } => {
-            // Determine required effect from callee path.
+            // Durable state cells: state.read / state.update.
+            // These require the `state` effect, and state.update must carry an
+            // `expected_version:` guard for optimistic concurrency.
             if let Expr::Path(path) = &callee.node {
-                if path.len() >= 2 {
-                    let _effect = format!("{}.{}", path[0].node, "write"); // simplified
-                                                                           // Heuristic: if the tool path ends with create_/update_/delete_/close_/merge_/push_ etc -> write; else read.
-                    let last = path.last().unwrap().node.as_str();
-                    let access = if is_write_name(last) { "write" } else { "read" };
-                    let required = format!("{}.{}", path[0].node, access);
-                    if !declared.iter().any(|d| {
-                        path_string(&d.node.path) == required
-                            || path_string(&d.node.path) == path[0].node
-                    }) {
-                        let declared_str = declared
-                            .iter()
-                            .map(|d| path_string(&d.node.path))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let effects_decl = if declared.is_empty() {
-                            "effects []".to_string()
-                        } else {
-                            format!("effects [{}]", declared_str)
-                        };
-                        diags.push(Diagnostic::new(
-                            codes::E_EFFECT_MISSING, Severity::Error, e.span,
-                            format!("Call to `{}` requires effect `{}`, but the enclosing scope does not declare it.", path_string(path), required),
-                        ).with_expected(format!("effects include {}", required))
-                         .with_actual(effects_decl.clone())
-                         .with_patch(effects_decl, format!("effects [{}, {}]", declared_str, required)));
+                if path.len() == 2 && path[0].node == "state" {
+                    check_state_call(path, args, declared, e.span, diags);
+                    check_expr(callee, declared, diags);
+                    for a in args {
+                        check_expr(&a.value, declared, diags);
                     }
+                    return;
                 }
             }
+            // Generic tool/model effect check.
+            check_call_effect(callee, declared, e.span, diags);
             check_expr(callee, declared, diags);
             for a in args {
                 check_expr(&a.value, declared, diags);
@@ -479,6 +463,124 @@ fn check_expr(e: &Spanned<Expr>, declared: &[Spanned<EffectRef>], diags: &mut Ve
             }
         }
         Expr::Lit(_) | Expr::Path(_) => {}
+    }
+}
+
+/// Check effect requirements for a generic tool/model call path.
+fn check_call_effect(
+    callee: &Spanned<Expr>,
+    declared: &[Spanned<EffectRef>],
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let path = match &callee.node {
+        Expr::Path(p) if p.len() >= 2 => p,
+        _ => return,
+    };
+    let last = path.last().unwrap().node.as_str();
+    let access = if is_write_name(last) { "write" } else { "read" };
+    let required = format!("{}.{}", path[0].node, access);
+    let has = declared.iter().any(|d| {
+        path_string(&d.node.path) == required || path_string(&d.node.path) == path[0].node
+    });
+    if has {
+        return;
+    }
+    let declared_str = declared
+        .iter()
+        .map(|d| path_string(&d.node.path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let effects_decl = if declared.is_empty() {
+        "effects []".to_string()
+    } else {
+        format!("effects [{}]", declared_str)
+    };
+    diags.push(
+        Diagnostic::new(
+            codes::E_EFFECT_MISSING,
+            Severity::Error,
+            span,
+            format!(
+                "Call to `{}` requires effect `{}`, but the enclosing scope does not declare it.",
+                path_string(path),
+                required
+            ),
+        )
+        .with_expected(format!("effects include {}", required))
+        .with_actual(effects_decl.clone())
+        .with_patch(
+            effects_decl,
+            format!("effects [{}, {}]", declared_str, required),
+        ),
+    );
+}
+
+/// Check durable state-cell access: `state.read` / `state.update`.
+///
+/// Both require the `state` effect. `state.update` must additionally carry an
+/// `expected_version:` named argument so writes are guarded against lost updates
+/// (optimistic concurrency).
+fn check_state_call(
+    path: &[Ident],
+    args: &[CallArg],
+    declared: &[Spanned<EffectRef>],
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let op = path.last().unwrap().node.as_str();
+    // Effect: state must be declared.
+    if !declared
+        .iter()
+        .any(|d| path_string(&d.node.path) == "state")
+    {
+        let declared_str = declared
+            .iter()
+            .map(|d| path_string(&d.node.path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let effects_decl = if declared.is_empty() {
+            "effects []".to_string()
+        } else {
+            format!("effects [{}]", declared_str)
+        };
+        diags.push(
+            Diagnostic::new(
+                codes::E_EFFECT_MISSING,
+                Severity::Error,
+                span,
+                format!(
+                    "State cell access `{}` requires effect `state`, but the enclosing scope does not declare it.",
+                    path_string(path)
+                ),
+            )
+            .with_expected("effects include state")
+            .with_actual(effects_decl.clone())
+            .with_patch(effects_decl, format!("effects [{}, state]", declared_str)),
+        );
+    }
+    // Guard: state.update must be version-guarded.
+    if op == "update" {
+        let guarded = args.iter().any(|a| {
+            a.name
+                .as_ref()
+                .is_some_and(|n| n.node == "expected_version")
+        });
+        if !guarded {
+            diags.push(
+                Diagnostic::new(
+                    codes::E_STATE_UPDATE_UNGUARDED,
+                    Severity::Error,
+                    span,
+                    "`state.update` without an `expected_version:` guard can clobber concurrent \
+                     writes. Pass the version from the prior `state.read`.",
+                )
+                .with_note(
+                    "state.update(key: \"k\", expected_version: v, value: x) — the runner rejects \
+                     the write if the stored version no longer matches.",
+                ),
+            );
+        }
     }
 }
 
