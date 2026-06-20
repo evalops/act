@@ -291,11 +291,11 @@ impl Parser {
     fn parse_item(&mut self) -> ParseResult<Item> {
         match self.peek_kind() {
             Some(TokenKind::KwType) => self.parse_type_decl().map(Item::TypeDecl),
-            Some(TokenKind::KwFn) => self.parse_fn(FnKind::Fn).map(Item::Fn),
-            Some(TokenKind::KwProc) => self.parse_fn(FnKind::Proc).map(Item::Proc),
-            Some(TokenKind::KwTask) => self.parse_fn(FnKind::Task).map(Item::Task),
+            Some(TokenKind::KwFn) => self.parse_fn(FnKind::Fn).map(|d| Item::Fn(Box::new(d))),
+            Some(TokenKind::KwProc) => self.parse_fn(FnKind::Proc).map(|d| Item::Proc(Box::new(d))),
+            Some(TokenKind::KwTask) => self.parse_fn(FnKind::Task).map(|d| Item::Task(Box::new(d))),
             Some(TokenKind::KwAgent) => self.parse_agent().map(Item::Agent),
-            Some(TokenKind::KwExtern) => self.parse_extern().map(|i| i),
+            Some(TokenKind::KwExtern) => self.parse_extern(),
             Some(TokenKind::KwTest) => self.parse_test(false).map(Item::Test),
             Some(TokenKind::KwEval) => self.parse_test(true).map(Item::Eval),
             Some(k) => {
@@ -311,11 +311,13 @@ impl Parser {
         match self.peek_kind() {
             Some(TokenKind::KwTool) => {
                 self.bump();
-                self.parse_extern_tool(start).map(Item::ExternTool)
+                self.parse_extern_tool(start)
+                    .map(|t| Item::ExternTool(Box::new(t)))
             }
             Some(TokenKind::KwModel) => {
                 self.bump();
-                self.parse_extern_model(start).map(Item::ExternModel)
+                self.parse_extern_model(start)
+                    .map(|t| Item::ExternModel(Box::new(t)))
             }
             _ => Err(self.err(start, "Expected `tool` or `model` after `extern`")),
         }
@@ -850,9 +852,8 @@ impl Parser {
         let start = self.expect(TokenKind::KwOn, "`on`")?.span;
         let kind = if self.eat(TokenKind::KwMessage) {
             EventKind::OnMessage
-        } else if self.eat(TokenKind::KwEvent) {
-            EventKind::On
         } else {
+            self.eat(TokenKind::KwEvent);
             EventKind::On
         };
         let path = self.path()?;
@@ -1209,7 +1210,7 @@ impl Parser {
             .iter()
             .last()
             .map(|i| i.span)
-            .unwrap_or_else(|| Span::dummy());
+            .unwrap_or_else(Span::dummy);
         let span = self.span_from(es, es);
         Ok(Stmt::Recover {
             error_ty: Spanned::new(span, error_ty),

@@ -24,6 +24,9 @@ impl Span {
     pub fn len(self) -> u32 {
         self.end - self.start
     }
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
     pub fn union(self, other: Span) -> Span {
         Span {
             file: self.file,
@@ -428,7 +431,7 @@ impl<'a> Lexer<'a> {
                 if self.peek2() == Some(b'&') {
                     tok!(TokenKind::AmpAmp, 2)
                 }
-                return Err(self.err(start, "Expected `&&`"));
+                Err(self.err(start, "Expected `&&`"))
             }
             b'!' => {
                 if self.peek2() == Some(b'=') {

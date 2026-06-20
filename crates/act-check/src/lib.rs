@@ -197,7 +197,7 @@ fn check_stmt(s: &Spanned<Stmt>, declared: &[Spanned<EffectRef>], diags: &mut Ve
 }
 
 fn block_has_effect(block: &Block) -> bool {
-    block.iter().any(|s| stmt_has_effect(s))
+    block.iter().any(stmt_has_effect)
 }
 
 fn stmt_has_effect(s: &Spanned<Stmt>) -> bool {
@@ -205,11 +205,11 @@ fn stmt_has_effect(s: &Spanned<Stmt>) -> bool {
         Stmt::Let { init, .. } | Stmt::Var { init, .. } => expr_has_effect(init),
         Stmt::Assign { target, value } => expr_has_effect(target) || expr_has_effect(value),
         Stmt::Expr(e) => expr_has_effect(e),
-        Stmt::Return(e) => e.as_ref().map_or(false, |e| expr_has_effect(e)),
+        Stmt::Return(e) => e.as_ref().is_some_and(expr_has_effect),
         Stmt::If { cond, then, else_ } => {
             expr_has_effect(cond)
                 || block_has_effect(then)
-                || else_.as_ref().map_or(false, block_has_effect)
+                || else_.as_ref().is_some_and(block_has_effect)
         }
         Stmt::For { iter, body, .. } => expr_has_effect(iter) || block_has_effect(body),
         Stmt::While { cond, body, .. } => expr_has_effect(cond) || block_has_effect(body),
@@ -221,7 +221,7 @@ fn stmt_has_effect(s: &Spanned<Stmt>) -> bool {
         Stmt::Require(e) | Stmt::Check { cond: e, .. } | Stmt::Ensure(e) => expr_has_effect(e),
         Stmt::Trace { fields, .. } => fields.iter().any(|(_, v)| expr_has_effect(v)),
         Stmt::Checkpoint { body, require, .. } => {
-            expr_has_effect(body) || require.as_ref().map_or(false, expr_has_effect)
+            expr_has_effect(body) || require.as_ref().is_some_and(expr_has_effect)
         }
         Stmt::Invariant { require, .. } => expr_has_effect(require),
     }
@@ -251,7 +251,7 @@ fn expr_has_effect(e: &Spanned<Expr>) -> bool {
         Expr::Await(_, body) => await_body_has_effect(body),
         Expr::Infer { .. } => true,
         Expr::Decide { source, .. } => expr_has_effect(source),
-        Expr::ResultCtor { value, .. } => value.as_ref().map_or(false, |v| expr_has_effect(v)),
+        Expr::ResultCtor { value, .. } => value.as_ref().is_some_and(|v| expr_has_effect(v)),
         Expr::Spawn { .. } => true,
         Expr::Hole(_) => false,
         Expr::Record(fields) => fields.iter().any(|(_, v)| expr_has_effect(v)),
@@ -296,8 +296,8 @@ fn check_expr(e: &Spanned<Expr>, declared: &[Spanned<EffectRef>], diags: &mut Ve
             // Determine required effect from callee path.
             if let Expr::Path(path) = &callee.node {
                 if path.len() >= 2 {
-                    let _effect = format!("{}.{}", path[0].node, "write".to_string()); // simplified
-                                                                                       // Heuristic: if the tool path ends with create_/update_/delete_/close_/merge_/push_ etc -> write; else read.
+                    let _effect = format!("{}.{}", path[0].node, "write"); // simplified
+                                                                           // Heuristic: if the tool path ends with create_/update_/delete_/close_/merge_/push_ etc -> write; else read.
                     let last = path.last().unwrap().node.as_str();
                     let access = if is_write_name(last) { "write" } else { "read" };
                     let required = format!("{}.{}", path[0].node, access);
@@ -311,7 +311,7 @@ fn check_expr(e: &Spanned<Expr>, declared: &[Spanned<EffectRef>], diags: &mut Ve
                             .collect::<Vec<_>>()
                             .join(", ");
                         let effects_decl = if declared.is_empty() {
-                            format!("effects []")
+                            "effects []".to_string()
                         } else {
                             format!("effects [{}]", declared_str)
                         };
@@ -709,10 +709,8 @@ fn check_compensation_stmt(
             check_compensation_expr(init, tools, diags, in_compensate);
         }
         Stmt::Expr(e) => check_compensation_expr(e, tools, diags, in_compensate),
-        Stmt::Return(e) => {
-            if let Some(e) = e {
-                check_compensation_expr(e, tools, diags, in_compensate);
-            }
+        Stmt::Return(Some(e)) => {
+            check_compensation_expr(e, tools, diags, in_compensate);
         }
         Stmt::If { then, else_, .. } => {
             for s in then {
@@ -849,10 +847,8 @@ fn check_taint(
                 check_taint_expr(init, tainted, diags);
             }
             Stmt::Expr(e) => check_taint_expr(e, tainted, diags),
-            Stmt::Return(e) => {
-                if let Some(e) = e {
-                    check_taint_expr(e, tainted, diags);
-                }
+            Stmt::Return(Some(e)) => {
+                check_taint_expr(e, tainted, diags);
             }
             Stmt::If { then, else_, .. } => {
                 check_taint(then, tainted, diags);
@@ -935,14 +931,13 @@ fn check_taint_expr(
                 check_taint_expr(&a.value, tainted, diags);
             }
         }
-        Expr::Await(_, body) => match &body.node {
-            AwaitBody::All(branches) => {
+        Expr::Await(_, body) => {
+            if let AwaitBody::All(branches) = &body.node {
                 for (_, e) in branches {
                     check_taint_expr(e, tainted, diags);
                 }
             }
-            _ => {}
-        },
+        }
         Expr::Record(fields) => {
             for (_, v) in fields {
                 check_taint_expr(v, tainted, diags);
@@ -970,10 +965,8 @@ fn collect_tainted_refs(
     found: &mut Vec<String>,
 ) {
     match &e.node {
-        Expr::Path(p) => {
-            if p.len() == 1 && tainted.contains(&p[0].node) {
-                found.push(p[0].node.clone());
-            }
+        Expr::Path(p) if p.len() == 1 && tainted.contains(&p[0].node) => {
+            found.push(p[0].node.clone());
         }
         Expr::Field { receiver, .. } => collect_tainted_refs(receiver, tainted, found),
         Expr::Record(fields) => {

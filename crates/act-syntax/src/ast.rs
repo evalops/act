@@ -110,12 +110,12 @@ pub enum UseKind {
 #[derive(Clone, Debug)]
 pub enum Item {
     TypeDecl(TypeDecl),
-    Fn(FnDecl),
-    Proc(FnDecl),
-    Task(FnDecl),
+    Fn(Box<FnDecl>),
+    Proc(Box<FnDecl>),
+    Task(Box<FnDecl>),
     Agent(AgentDecl),
-    ExternTool(ExternTool),
-    ExternModel(ExternModel),
+    ExternTool(Box<ExternTool>),
+    ExternModel(Box<ExternModel>),
     Test(TestBlock),
     Eval(TestBlock),
 }
