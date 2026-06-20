@@ -1,0 +1,13 @@
+[package]
+name = "act-fmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+act-syntax.workspace = true
+
+[dev-dependencies]
+act-parser.workspace = true

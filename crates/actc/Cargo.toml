@@ -15,6 +15,7 @@ act-syntax.workspace = true
 act-parser.workspace = true
 act-diagnostics.workspace = true
 act-check.workspace = true
+act-fmt.workspace = true
 act-ir.workspace = true
 serde.workspace = true
 serde_json.workspace = true

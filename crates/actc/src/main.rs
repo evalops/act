@@ -9,6 +9,7 @@ fn main() -> ExitCode {
         eprintln!("  check <file.act>       parse + check, print diagnostics as JSON");
         eprintln!("  parse <file.act>       parse only, print AST summary");
         eprintln!("  lower <file.act>       parse + check + lower to graph IR, print JSON");
+        eprintln!("  fmt   <file.act>       parse + format to canonical source");
         eprintln!("  lex   <file.act>       lex only, print tokens");
         return ExitCode::from(2);
     }
@@ -105,6 +106,16 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         }
+        "fmt" => match act_parser::parse_module(&src, file_id) {
+            Ok(m) => {
+                print!("{}", act_fmt::format_module(&m));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("parse error: {} at {:?}", e.message, e.span);
+                ExitCode::from(1)
+            }
+        },
         other => {
             eprintln!("unknown command: {}", other);
             ExitCode::from(2)

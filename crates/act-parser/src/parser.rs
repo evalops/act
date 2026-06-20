@@ -1015,7 +1015,9 @@ impl Parser {
                 Some(vec![s])
             } else {
                 self.expect(TokenKind::LBrace, "`{`")?;
-                Some(self.parse_block()?)
+                let block = self.parse_block()?;
+                self.expect(TokenKind::RBrace, "`}`")?;
+                Some(block)
             }
         } else {
             None
@@ -1528,6 +1530,13 @@ impl Parser {
     fn parse_primary(&mut self) -> ParseResult<Spanned<Expr>> {
         let start = self.peek().map(|t| t.span).unwrap_or(LexSpan::dummy());
         match self.peek_kind() {
+            Some(TokenKind::LParen) => {
+                // Parenthesized grouping: (expr)
+                self.bump();
+                let inner = self.parse_expr()?;
+                self.expect(TokenKind::RParen, "`)`")?;
+                Ok(inner)
+            }
             Some(TokenKind::Int) => {
                 let t = self.bump().unwrap();
                 let n: i64 = t.text.parse().unwrap_or(0);
