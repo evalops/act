@@ -163,7 +163,7 @@ pub struct Field {
 pub struct Variant {
     pub span: Span,
     pub name: Ident,
-    pub payload: Option<Spanned<Ty>>,
+    pub fields: Vec<(Option<Ident>, Spanned<Ty>)>,
 }
 
 /// Function declaration. Shared by `fn`, `proc`, `task`.

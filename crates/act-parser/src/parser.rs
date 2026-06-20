@@ -40,6 +40,8 @@ fn is_soft_keyword(k: TokenKind) -> bool {
             | TokenKind::KwMessage
             | TokenKind::KwEvent
             | TokenKind::KwOn
+            | TokenKind::KwTool
+            | TokenKind::KwLib
     )
 }
 
@@ -154,7 +156,7 @@ impl Parser {
 
     /// Parse a version string after `@`: accepts Ident, Int, or Decimal.
     fn version(&mut self) -> ParseResult<String> {
-        let t = match self.peek_kind() {
+        let first = match self.peek_kind() {
             Some(TokenKind::Ident) | Some(TokenKind::Int) | Some(TokenKind::Decimal) => {
                 self.bump().unwrap().text
             }
@@ -165,7 +167,24 @@ impl Parser {
                 ))
             }
         };
-        Ok(t)
+        let mut version = first;
+        while let Some(k) = self.peek_kind() {
+            match k {
+                TokenKind::Minus => {
+                    self.bump();
+                    version.push('-');
+                }
+                TokenKind::Int | TokenKind::Decimal => {
+                    version.push_str(&self.bump().unwrap().text);
+                }
+                TokenKind::Dot => {
+                    self.bump();
+                    version.push('.');
+                }
+                _ => break,
+            }
+        }
+        Ok(version)
     }
 
     /// Parse a dotted path: `a.b.c`. A single ident is also a path.
@@ -247,11 +266,7 @@ impl Parser {
         };
         let path = self.path()?;
         let version = if self.eat(TokenKind::At) {
-            // version can be Ident-like or decimal
-            let t = self
-                .bump()
-                .ok_or_else(|| self.err(LexSpan::dummy(), "version expected"))?;
-            Some(t.text)
+            Some(self.version()?)
         } else {
             None
         };
@@ -421,29 +436,37 @@ impl Parser {
                 loop {
                     let vstart = self.peek().map(|t| t.span).unwrap_or(start);
                     let vname = self.ident()?;
-                    let payload = if self.eat(TokenKind::LParen) {
-                        // Variant payload: either `name: Type` or just `Type`.
-                        // If it's `name:`, skip the name; otherwise it's the type.
-                        if self
-                            .peek_kind()
-                            .map(|k| k == TokenKind::Ident || is_soft_keyword(k))
-                            .unwrap_or(false)
-                            && self.peek2().map(|t| t.kind) == Some(TokenKind::Colon)
-                        {
-                            self.bump(); // name
-                            self.expect(TokenKind::Colon, "`:`")?;
+                    let fields = if self.eat(TokenKind::LParen) {
+                        let mut fields = Vec::new();
+                        loop {
+                            let name = if self
+                                .peek_kind()
+                                .map(|k| k == TokenKind::Ident || is_soft_keyword(k))
+                                .unwrap_or(false)
+                                && self.peek2().map(|t| t.kind) == Some(TokenKind::Colon)
+                            {
+                                let n = self.ident()?;
+                                self.expect(TokenKind::Colon, "`:`")?;
+                                Some(n)
+                            } else {
+                                None
+                            };
+                            let ty = self.parse_ty()?;
+                            fields.push((name, ty));
+                            if !self.eat(TokenKind::Comma) {
+                                break;
+                            }
                         }
-                        let ty = self.parse_ty()?;
                         self.expect(TokenKind::RParen, "`)`")?;
-                        Some(ty)
+                        fields
                     } else {
-                        None
+                        Vec::new()
                     };
                     let vend = self.peek().map(|t| t.span).unwrap_or(vstart);
                     variants.push(Variant {
                         span: self.span_from(vstart, vend),
                         name: vname,
-                        payload,
+                        fields,
                     });
                     if !self.eat(TokenKind::Pipe) {
                         break;
@@ -738,11 +761,28 @@ impl Parser {
                 }
                 _ => return Err(self.err(cstart, "Expected `may`/`must_not`/`require_human`")),
             };
-            let target = self.path()?;
-            let where_clause = if self.eat(TokenKind::KwWhere) {
-                Some(self.parse_expr()?)
-            } else {
-                None
+            let (target, where_clause) = match verb {
+                PolicyVerb::RequireHuman => {
+                    // require_human when <expr> — no target path, condition after `when`.
+                    let cond = if self.at(TokenKind::Ident)
+                        && self.peek().map(|t| t.text.as_str()) == Some("when")
+                    {
+                        self.bump();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    (Vec::new(), cond)
+                }
+                PolicyVerb::May | PolicyVerb::MustNot => {
+                    let target = self.path()?;
+                    let where_clause = if self.eat(TokenKind::KwWhere) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    (target, where_clause)
+                }
             };
             let cend = self.peek().map(|t| t.span).unwrap_or(cstart);
             clauses.push(PolicyClause {
@@ -1097,7 +1137,12 @@ impl Parser {
 
     fn parse_trace(&mut self) -> ParseResult<Stmt> {
         self.bump();
-        let label = self.ident()?;
+        let label = if self.at(TokenKind::String) {
+            let t = self.bump().unwrap();
+            Ident::new(self.span(&t), t.text)
+        } else {
+            self.ident()?
+        };
         self.expect(TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while !self.at(TokenKind::RBrace) {
@@ -1975,16 +2020,21 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RBracket, "`]`")?;
-        let require = if self.eat(TokenKind::KwRequire) {
+        let require = if self.eat(TokenKind::KwAccept) || self.eat(TokenKind::KwRequire) {
             Some(Box::new(self.parse_expr()?))
         } else {
             None
         };
         let else_ = if self.eat(TokenKind::KwElse) {
-            self.expect(TokenKind::LBrace, "`{`")?;
-            let b = self.parse_block()?;
-            self.expect(TokenKind::RBrace, "`}`")?;
-            Some(b)
+            if self.at(TokenKind::LBrace) {
+                self.bump();
+                let b = self.parse_block()?;
+                self.expect(TokenKind::RBrace, "`}`")?;
+                Some(b)
+            } else {
+                // else <statement> without braces
+                Some(vec![self.parse_stmt()?])
+            }
         } else {
             None
         };

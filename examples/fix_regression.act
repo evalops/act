@@ -1,0 +1,174 @@
+module evalops.fix_regression@0.1
+
+use tool github@2 as gh
+use tool evalops@1 as eo
+use model codegen@2026-06 as coder
+
+type Repo = {
+  owner: String,
+  name: String,
+}
+
+type Hash = String
+
+type Input = {
+  repo: Repo,
+  run_id: String,
+  base_sha: Hash,
+  head_sha: Hash,
+}
+
+type Score = Decimal where 0.0 <= self <= 1.0
+
+type Evidence = {
+  source: String,
+  quote?: String,
+  observed_at: String,
+}
+
+type Hypothesis = {
+  claim: String,
+  evidence: [Evidence],
+  confidence: Score,
+}
+
+type PatchAttempt = {
+  hypothesis: Hypothesis,
+  files_changed: [String],
+  tests_passed: Int,
+  tests_failed: Int,
+  pass_rate: Score,
+  confidence: Score,
+}
+
+type FixResult = {
+  pr_url: String,
+  root_cause: Hypothesis,
+  confidence: Score,
+}
+
+type FixError =
+  | low_confidence(reason: String)
+  | tool_failed(tool: String, cause: String)
+  | budget_exhausted
+  | policy_denied(reason: String)
+
+fn combine_evidence(h1: [Evidence], h2: [Evidence]) -> [Evidence] {
+  h1
+}
+
+fn render_pr_body(attempt: PatchAttempt) -> String {
+  attempt.hypothesis.claim
+}
+
+task fix_regression(input: Input) -> Result<FixResult, FixError>
+  effects [gh.read, gh.write, eo.read, eo.write, model]
+  needs [
+    cap gh.pull_request.create(input.repo),
+    cap gh.pull_request.read(input.repo),
+  ]
+  budget {
+    wall_time <= 30m,
+    tokens <= 150_000,
+    cost <= 8.00,
+    tool_calls <= 100,
+  }
+  policy_expect {
+    may gh.create_pull_request
+    must_not gh.merge_pull_request
+    must_not gh.push_branch where true
+    require_human when true
+  }
+{
+  let results = await all {
+    logs: eo.fetch_logs(run_id: input.run_id, max_bytes: 2_000_000),
+    diff: gh.compare(repo: input.repo, base: input.base_sha, head: input.head_sha),
+    failures: eo.failing_tests(run_id: input.run_id),
+  }
+
+  let hypotheses = infer [Hypothesis] using coder {
+    goal: "Find likely root causes for this regression."
+    input: {
+      logs: results.logs,
+      diff: results.diff,
+      failures: results.failures,
+    }
+    constraints: [
+      "Each hypothesis must cite concrete evidence.",
+      "Prefer minimal explanations over broad guesses.",
+      "Return at most 5 hypotheses.",
+    ]
+  } accept {
+    confidence >= 0.65,
+  } else {
+    return err(low_confidence("No grounded root cause hypothesis."))
+  }
+
+  let patches = await map h in hypotheses parallel 3 limit 5 {
+    propose_and_test_patch(input.repo, h, results.failures)
+  }
+
+  let best = decide PatchAttempt from patches
+    score by [
+      0.5: pass_rate desc,
+      0.3: confidence desc,
+      0.2: files_changed asc,
+    ]
+    accept confidence >= 0.80
+    else return err(low_confidence("No patch cleared confidence threshold."))
+
+  check best.pass_rate >= 0.95 else {
+    return err(low_confidence("Patch pass rate below 0.95"))
+  }
+  check best.files_changed.len <= 20 else {
+    return err(tool_failed("propose_patch", "Too many files changed"))
+  }
+
+  let pr = try gh.create_pull_request(
+    repo: input.repo,
+    branch: "agent/fix",
+    title: best.hypothesis.claim,
+    body: render_pr_body(best),
+  )
+  defer compensate {
+    gh.close_pull_request(repo: input.repo, branch: "agent/fix")
+  }
+
+  trace "selected_root_cause" {
+    claim: best.hypothesis.claim,
+    confidence: best.confidence,
+    evidence: best.hypothesis.evidence,
+  }
+
+  return ok({
+    pr_url: pr,
+    root_cause: best.hypothesis,
+    confidence: best.confidence,
+  })
+}
+
+proc propose_and_test_patch(
+  repo: Repo,
+  h: Hypothesis,
+  failures: [String],
+) -> PatchAttempt
+  effects [gh.read, eo.write, model]
+{
+  let patch = infer PatchAttempt using coder {
+    goal: "Create a minimal patch for the hypothesis."
+    input: {
+      repo: repo,
+      hypothesis: h,
+      failures: failures,
+    }
+    constraints: [
+      "Prefer changing existing code over adding new abstractions.",
+      "Add or update a regression test when possible.",
+      "Do not touch generated files.",
+    ]
+  } accept {
+    confidence >= 0.70,
+  }
+
+  return patch
+}
