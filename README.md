@@ -51,8 +51,55 @@ crates/
   act-parser       parser -> AST
   act-diagnostics  structured JSON diagnostics
   act-check        type, effect, capability, taint, budget checking
+  act-fmt          canonical formatter (AST -> source, idempotent)
   act-ir           lowering to executable graph IR
   actc             CLI
+```
+
+## What the compiler enforces
+
+| Code | Rule |
+|------|------|
+| `E_EFFECT_MISSING` | A tool/model call requires an effect not declared in scope |
+| `E_UNBOUNDED_LOOP` | An effectful `while` loop has no `max` bound |
+| `E_CHECK_UNHANDLED` | `check` without `else` bypasses the typed error enum |
+| `E_SECRET_LEAK` | A `Secret<T>` value flows into a model `infer` input |
+| `E_STATE_UPDATE_UNGUARDED` | `state.update` without an `expected_version:` guard can clobber concurrent writes |
+| `E_COMPENSATION_MISSING` | A non-idempotent write inside a budgeted task has no `defer compensate` |
+| `E_POLICY_MAY_UNGRANTED` | `policy_expect may X` but no matching capability is granted |
+| `E_POLICY_MUST_NOT_GRANTED` | `policy_expect must_not X` but capability `X` IS granted |
+| `E_REPLAY_WITHOUT_TRACE` | `replay trace("X")` references a trace that is never recorded |
+| `E_HOLE_UNFILLED` | A typed hole `??` was not filled |
+| `W_MODEL_CONFIDENCE_HIGH_THRESHOLD` | Model confidence threshold >= 0.90 (unreliable self-report) |
+
+## Build & test
+
+```sh
+cargo build
+cargo test
+cargo clippy --all-targets -- -D warnings   # enforced in CI
+cargo fmt --all -- --check                  # enforced in CI
+```
+
+## CLI
+
+```sh
+actc lex   <file.act>   # lex, print tokens
+actc parse <file.act>   # parse, print a module summary
+actc check <file.act>   # parse + check, print JSON diagnostics
+actc lower <file.act>   # parse + check + lower to graph IR, print JSON
+actc fmt   <file.act>   # parse + format to canonical source
+```
+
+## Example
+
+`examples/fix_regression.act` is an end-to-end task: it fetches logs and a diff
+in parallel, infers root-cause hypotheses, decides the best patch by weighted
+score, opens a pull request, and records a trace an eval can replay.
+
+```sh
+actc check examples/fix_regression.act   # {"ok": true, "diagnostics": []}
+actc fmt   examples/fix_regression.act   # canonicalized source
 ```
 
 ## License
