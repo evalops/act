@@ -405,7 +405,10 @@ pub enum Stmt {
         body: Block,
     },
     Require(Spanned<Expr>),
-    Check(Spanned<Expr>),
+    Check {
+        cond: Spanned<Expr>,
+        else_block: Option<Block>,
+    },
     Ensure(Spanned<Expr>),
     Trace {
         label: Ident,
@@ -546,6 +549,7 @@ pub struct InferSpec {
 #[derive(Clone, Debug)]
 pub struct ScoreClause {
     pub span: Span,
+    pub weight: Option<Spanned<Expr>>,
     pub field: Path,
     pub dir: SortDir,
 }

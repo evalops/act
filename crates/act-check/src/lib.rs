@@ -18,10 +18,13 @@ pub fn check(module: &Module) -> CheckOutput {
     let mut diags = Vec::new();
     let mut declared = Vec::new();
 
+    // Collect extern tool declarations for idempotency checking.
+    let tool_decls = collect_tool_decls(module);
+
     for item in &module.items {
         match item {
             Item::Fn(d) | Item::Proc(d) | Item::Task(d) => {
-                check_fn(d, &mut diags);
+                check_fn(d, &tool_decls, &mut diags);
                 declared.push((
                     d.name.id,
                     d.effects
@@ -45,6 +48,24 @@ pub fn check(module: &Module) -> CheckOutput {
     }
 }
 
+struct ToolDeclInfo {
+    path: String,
+    idempotent: bool,
+}
+
+fn collect_tool_decls(module: &Module) -> Vec<ToolDeclInfo> {
+    let mut tools = Vec::new();
+    for item in &module.items {
+        if let Item::ExternTool(t) = item {
+            tools.push(ToolDeclInfo {
+                path: path_string(&t.path),
+                idempotent: t.idempotent_by.is_some(),
+            });
+        }
+    }
+    tools
+}
+
 fn path_string(p: &[Ident]) -> String {
     p.iter()
         .map(|i| i.node.as_str())
@@ -52,17 +73,27 @@ fn path_string(p: &[Ident]) -> String {
         .join(".")
 }
 
-fn check_fn(d: &FnDecl, diags: &mut Vec<Diagnostic>) {
+fn check_fn(d: &FnDecl, tools: &[ToolDeclInfo], diags: &mut Vec<Diagnostic>) {
     if d.body.is_none() {
-        // extern-ish or declared only; skip
         return;
     }
-    let declared: Vec<String> = d
-        .effects
-        .iter()
-        .map(|e| path_string(&e.node.path))
-        .collect();
-    check_block(d.body.as_ref().unwrap(), &d.effects, diags);
+    let body = d.body.as_ref().unwrap();
+    check_block(body, &d.effects, diags);
+
+    // Rule 4: policy_expect vs needs cross-check.
+    check_policy_vs_needs(d, diags);
+
+    // Rule 3: compensation requirement for non-idempotent writes.
+    if d.kind == FnKind::Task {
+        let has_write = d.effects.iter().any(|e| {
+            let p = path_string(&e.node.path);
+            p.ends_with(".write") || p == "gh.write"
+        });
+        let has_budget = d.budget.is_some();
+        if has_write && has_budget {
+            check_compensation(body, tools, diags);
+        }
+    }
 }
 
 /// Walk a block and verify every tool/model call's effects are declared.
@@ -122,7 +153,25 @@ fn check_stmt(s: &Spanned<Stmt>, declared: &[Spanned<EffectRef>], diags: &mut Ve
             check_block(body, declared, diags);
         }
         Stmt::Defer { body, .. } => check_block(body, declared, diags),
-        Stmt::Require(e) | Stmt::Check(e) | Stmt::Ensure(e) => check_expr(e, declared, diags),
+        Stmt::Require(e) | Stmt::Ensure(e) => check_expr(e, declared, diags),
+        Stmt::Check { cond, else_block } => {
+            check_expr(cond, declared, diags);
+            // Rule 2: check without else bypasses the typed error enum.
+            if else_block.is_none() {
+                diags.push(
+                    Diagnostic::new(
+                        codes::E_CHECK_UNHANDLED,
+                        Severity::Error,
+                        s.span,
+                        "`check` without an `else` clause bypasses the typed error enum. \
+                         Add `else { return err(...) }` to map the failure to a typed error.",
+                    )
+                    .with_patch("check cond", "check cond else { return err(...) }"),
+                );
+            } else {
+                check_block(else_block.as_ref().unwrap(), declared, diags);
+            }
+        }
         Stmt::Trace { fields, .. } => {
             for (_, v) in fields {
                 check_expr(v, declared, diags);
@@ -160,7 +209,7 @@ fn stmt_has_effect(s: &Spanned<Stmt>) -> bool {
         }
         Stmt::Recover { from, body, .. } => expr_has_effect(from) || block_has_effect(body),
         Stmt::Defer { body, .. } => block_has_effect(body),
-        Stmt::Require(e) | Stmt::Check(e) | Stmt::Ensure(e) => expr_has_effect(e),
+        Stmt::Require(e) | Stmt::Check { cond: e, .. } | Stmt::Ensure(e) => expr_has_effect(e),
         Stmt::Trace { fields, .. } => fields.iter().any(|(_, v)| expr_has_effect(v)),
         Stmt::Checkpoint { body, require, .. } => {
             expr_has_effect(body) || require.as_ref().map_or(false, expr_has_effect)
@@ -238,13 +287,14 @@ fn check_expr(e: &Spanned<Expr>, declared: &[Spanned<EffectRef>], diags: &mut Ve
             // Determine required effect from callee path.
             if let Expr::Path(path) = &callee.node {
                 if path.len() >= 2 {
-                    let effect = format!("{}.{}", path[0].node, "write".to_string()); // simplified
+                    let _effect = format!("{}.{}", path[0].node, "write".to_string()); // simplified
                                                                                       // Heuristic: if the tool path ends with create_/update_/delete_/close_/merge_/push_ etc -> write; else read.
                     let last = path.last().unwrap().node.as_str();
                     let access = if is_write_name(last) { "write" } else { "read" };
                     let required = format!("{}.{}", path[0].node, access);
                     if !declared.iter().any(|d| {
-                        path_string(&d.node.path) == required || path_string(&d.node.path) == path[0].node
+                        path_string(&d.node.path) == required
+                            || path_string(&d.node.path) == path[0].node
                     }) {
                         let declared_str = declared
                             .iter()
@@ -290,7 +340,10 @@ fn check_expr(e: &Spanned<Expr>, declared: &[Spanned<EffectRef>], diags: &mut Ve
         Expr::Await(_, body) => check_await_body(body, declared, diags),
         Expr::Infer { model, spec, .. } => {
             check_expr(model, declared, diags);
-            if !declared.iter().any(|d| path_string(&d.node.path) == "model") {
+            if !declared
+                .iter()
+                .any(|d| path_string(&d.node.path) == "model")
+            {
                 let declared_str = declared
                     .iter()
                     .map(|d| path_string(&d.node.path))
@@ -331,6 +384,28 @@ fn check_expr(e: &Spanned<Expr>, declared: &[Spanned<EffectRef>], diags: &mut Ve
             }
             if let Some(b) = &spec.else_ {
                 check_block(b, declared, diags);
+            }
+            // Rule 1: warn when model confidence threshold is unrealistically high.
+            // Model self-reported confidence above 0.90 is unreliable; require
+            // a verifier-derived score or explicit calibration instead.
+            if let Some(accept) = &spec.accept {
+                if let Some(threshold) = extract_confidence_threshold(accept) {
+                    if threshold >= 0.90 {
+                        diags.push(
+                            Diagnostic::new(
+                                codes::W_MODEL_CONFIDENCE_HIGH_THRESHOLD,
+                                Severity::Warning,
+                                e.span,
+                                format!(
+                                    "Model confidence threshold {:.2} is above 0.90. \
+                                     Model self-reported confidence at this level is unreliable. \
+                                     Use a VerifierScore (from tests/tools) or calibrate explicitly.",
+                                    threshold
+                                ),
+                            ),
+                        );
+                    }
+                }
             }
         }
         Expr::Decide {
@@ -441,4 +516,272 @@ fn is_write_name(name: &str) -> bool {
         "run_",
     ];
     prefixes.iter().any(|p| name.starts_with(p)) || name == "create_pull_request"
+}
+
+// =====================================================================
+// Rule 1: Confidence provenance — extract threshold from accept clause
+// =====================================================================
+
+/// Try to extract a numeric threshold from an accept expression like
+/// `confidence >= 0.80` or `value.confidence >= 0.95`.
+fn extract_confidence_threshold(expr: &Spanned<Expr>) -> Option<f64> {
+    if let Expr::Bin {
+        op: BinOp::Ge,
+        lhs,
+        rhs,
+        ..
+    } = &expr.node
+    {
+        // Check that lhs references "confidence"
+        if expr_mentions_confidence(lhs) {
+            return expr_to_f64(rhs);
+        }
+    }
+    // Also handle `expr && expr` by recursing into the first arm.
+    if let Expr::Bin {
+        op: BinOp::And,
+        lhs,
+        ..
+    } = &expr.node
+    {
+        return extract_confidence_threshold(lhs);
+    }
+    None
+}
+
+fn expr_mentions_confidence(e: &Spanned<Expr>) -> bool {
+    match &e.node {
+        Expr::Path(p) => p.iter().any(|i| i.node == "confidence"),
+        Expr::Field { name, .. } => name.node == "confidence",
+        _ => false,
+    }
+}
+
+fn expr_to_f64(e: &Spanned<Expr>) -> Option<f64> {
+    match &e.node {
+        Expr::Lit(Literal::Decimal(s)) => s.parse().ok(),
+        Expr::Lit(Literal::Int(n)) => Some(*n as f64),
+        _ => None,
+    }
+}
+
+// =====================================================================
+// Rule 4: policy_expect vs needs — compile-time cross-check
+// =====================================================================
+
+fn check_policy_vs_needs(d: &FnDecl, diags: &mut Vec<Diagnostic>) {
+    let policy = match &d.policy_expect {
+        Some(p) => &p.node,
+        None => return,
+    };
+
+    // Build the set of granted capability keywords.
+    let granted_caps: Vec<String> = d.needs.iter().map(|c| path_string(&c.node.path)).collect();
+
+    for clause in &policy.clauses {
+        let target = path_string(&clause.target);
+        match clause.verb {
+            PolicyVerb::May => {
+                // `may X` requires the corresponding capability to be granted.
+                if !caps_cover_target(&granted_caps, &target) {
+                    diags.push(
+                        Diagnostic::new(
+                            codes::E_POLICY_MAY_UNGRANTED,
+                            Severity::Error,
+                            clause.span,
+                            format!(
+                                "policy_expect declares `may {}` but no matching capability is granted in `needs`.",
+                                target
+                            ),
+                        )
+                        .with_note("Either add the capability to `needs`, or remove this policy clause."),
+                    );
+                }
+            }
+            PolicyVerb::MustNot => {
+                // `must_not X` requires the corresponding capability to NOT be granted.
+                if caps_cover_target(&granted_caps, &target) {
+                    diags.push(
+                        Diagnostic::new(
+                            codes::E_POLICY_MUST_NOT_GRANTED,
+                            Severity::Error,
+                            clause.span,
+                            format!(
+                                "policy_expect declares `must_not {}` but a matching capability IS granted in `needs`. Contradiction.",
+                                target
+                            ),
+                        )
+                        .with_note("Remove the capability from `needs`, or remove this policy clause."),
+                    );
+                }
+            }
+            PolicyVerb::RequireHuman => {}
+        }
+    }
+}
+
+/// Check if any granted cap covers the policy target.
+/// Requires matching the tool prefix AND at least one action verb.
+/// `gh.merge_pull_request` matches `gh.pull_request.merge` (both have verb "merge"),
+/// but NOT `gh.pull_request.create` (different verbs).
+fn caps_cover_target(caps: &[String], target: &str) -> bool {
+    let target_tool = target.split('.').next().unwrap_or("");
+    let target_verbs = action_verbs(target);
+    if target_verbs.is_empty() {
+        return false;
+    }
+    caps.iter().any(|cap| {
+        let cap_tool = cap.split('.').next().unwrap_or("");
+        let cap_verbs = action_verbs(cap);
+        cap_tool == target_tool && cap_verbs.intersection(&target_verbs).count() > 0
+    })
+}
+
+/// Extract action verbs from a path. Verbs: create, merge, delete, close,
+/// update, read, write, comment, push, apply, run.
+fn action_verbs(s: &str) -> std::collections::HashSet<String> {
+    const VERBS: &[&str] = &[
+        "create", "merge", "delete", "close", "update", "read", "write", "comment", "push",
+        "apply", "run",
+    ];
+    s.split(['.', '_'])
+        .filter_map(|p| {
+            let lower = p.to_lowercase();
+            if VERBS.contains(&lower.as_str()) {
+                Some(lower)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+// =====================================================================
+// Rule 3: Compensation requirement for non-idempotent writes
+// =====================================================================
+
+fn check_compensation(block: &Block, tools: &[ToolDeclInfo], diags: &mut Vec<Diagnostic>) {
+    // If any defer compensate exists in this block, all writes are covered.
+    let has_defer = block_has_defer_compensate(block);
+    for stmt in block {
+        check_compensation_stmt(stmt, tools, diags, has_defer);
+    }
+}
+
+fn block_has_defer_compensate(block: &Block) -> bool {
+    block.iter().any(|s| {
+        matches!(
+            &s.node,
+            Stmt::Defer {
+                kind: DeferKind::Compensate,
+                ..
+            }
+        )
+    })
+}
+
+fn check_compensation_stmt(
+    s: &Spanned<Stmt>,
+    tools: &[ToolDeclInfo],
+    diags: &mut Vec<Diagnostic>,
+    in_compensate: bool,
+) {
+    match &s.node {
+        Stmt::Defer {
+            kind: DeferKind::Compensate,
+            body,
+        } => {
+            // Everything inside a compensate block is covered.
+            for inner in body {
+                check_compensation_stmt(inner, tools, diags, true);
+            }
+        }
+        Stmt::Let { init, .. } | Stmt::Var { init, .. } => {
+            check_compensation_expr(init, tools, diags, in_compensate);
+        }
+        Stmt::Expr(e) => check_compensation_expr(e, tools, diags, in_compensate),
+        Stmt::Return(e) => {
+            if let Some(e) = e {
+                check_compensation_expr(e, tools, diags, in_compensate);
+            }
+        }
+        Stmt::If { then, else_, .. } => {
+            for s in then {
+                check_compensation_stmt(s, tools, diags, in_compensate);
+            }
+            if let Some(e) = else_ {
+                for s in e {
+                    check_compensation_stmt(s, tools, diags, in_compensate);
+                }
+            }
+        }
+        Stmt::For { body, .. } | Stmt::While { body, .. } => {
+            for s in body {
+                check_compensation_stmt(s, tools, diags, in_compensate);
+            }
+        }
+        Stmt::Match { arms, .. } => {
+            for arm in arms {
+                for s in &arm.body {
+                    check_compensation_stmt(s, tools, diags, in_compensate);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_compensation_expr(
+    e: &Spanned<Expr>,
+    tools: &[ToolDeclInfo],
+    diags: &mut Vec<Diagnostic>,
+    in_compensate: bool,
+) {
+    match &e.node {
+        Expr::Call { callee, .. } => {
+            if let Expr::Path(path) = &callee.node {
+                if path.len() >= 2 {
+                    let name = &path.last().unwrap().node;
+                    if is_write_name(name) && !in_compensate {
+                        // Check if the tool is declared idempotent.
+                        let tool_path = path_string(path);
+                        let is_idempotent =
+                            tools.iter().any(|t| t.path == tool_path && t.idempotent);
+                        if !is_idempotent {
+                            diags.push(
+                                Diagnostic::new(
+                                    codes::E_COMPENSATION_MISSING,
+                                    Severity::Error,
+                                    e.span,
+                                    format!(
+                                        "Non-idempotent write `{}` in a budgeted task without compensation. \
+                                         Add `defer compensate {{ ... }}` or declare the tool `idempotent by ...`.",
+                                        tool_path
+                                    ),
+                                )
+                                .with_note("If the task fails after this write, there is no rollback path."),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Await(_, body) => {
+            // Check branches of parallel/race/quorum.
+            match &body.node {
+                AwaitBody::All(branches) => {
+                    for (_, e) in branches {
+                        check_compensation_expr(e, tools, diags, in_compensate);
+                    }
+                }
+                AwaitBody::Map { body, .. } => {
+                    for s in body {
+                        check_compensation_stmt(s, tools, diags, in_compensate);
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
 }

@@ -34,6 +34,12 @@ fn is_soft_keyword(k: TokenKind) -> bool {
             | TokenKind::KwRubric
             | TokenKind::KwValidate
             | TokenKind::KwAccept
+            | TokenKind::KwTest
+            | TokenKind::KwEval
+            | TokenKind::KwModel
+            | TokenKind::KwMessage
+            | TokenKind::KwEvent
+            | TokenKind::KwOn
     )
 }
 
@@ -911,7 +917,16 @@ impl Parser {
             }
             Some(TokenKind::KwCheck) => {
                 self.bump();
-                Stmt::Check(self.parse_expr()?)
+                let cond = self.parse_expr()?;
+                let else_block = if self.eat(TokenKind::KwElse) {
+                    self.expect(TokenKind::LBrace, "`{`")?;
+                    let b = self.parse_block()?;
+                    self.expect(TokenKind::RBrace, "`}`")?;
+                    Some(b)
+                } else {
+                    None
+                };
+                Stmt::Check { cond, else_block }
             }
             Some(TokenKind::KwEnsure) => {
                 self.bump();
@@ -1652,7 +1667,7 @@ impl Parser {
                 let end = self.expect(TokenKind::RBracket, "`]`")?.span;
                 Ok(Spanned::new(self.span_from(start, end), Expr::Array(elems)))
             }
-            Some(TokenKind::Ident) => {
+            Some(k) if k == TokenKind::Ident || is_soft_keyword(k) => {
                 let path = self.path()?;
                 let span = self.span_from(start, self.peek().map(|t| t.span).unwrap_or(start));
                 Ok(Spanned::new(span, Expr::Path(path)))
@@ -1842,7 +1857,7 @@ impl Parser {
                 }
                 _ => {
                     let t = self.peek().cloned();
-                    if let Some(t) = t {
+                    if let Some(_t) = t {
                         self.bump();
                     } else {
                         break;
@@ -1863,9 +1878,9 @@ impl Parser {
             accept,
             else_: None,
         };
-        // optional `require { ... } else { ... }`
+        // optional `accept { ... } else { ... }` (also accept legacy `require`)
         let mut spec = spec;
-        if self.eat(TokenKind::KwRequire) {
+        if self.eat(TokenKind::KwAccept) || self.eat(TokenKind::KwRequire) {
             self.expect(TokenKind::LBrace, "`{`")?;
             // parse a comma list of expressions; combine via And
             let mut conds = Vec::new();
@@ -1910,12 +1925,30 @@ impl Parser {
         let ty = self.parse_ty()?;
         self.expect(TokenKind::KwFrom, "`from`")?;
         let source = self.parse_expr()?;
-        self.expect(TokenKind::KwScore, "`score`")?;
+        // `score by [...]` (weighted) or `lex by [...]` (lexicographic)
+        let _is_lex =
+            if self.at(TokenKind::Ident) && self.peek().map(|t| t.text.as_str()) == Some("lex") {
+                self.bump();
+                true
+            } else {
+                self.expect(TokenKind::KwScore, "`score` or `lex`")?;
+                false
+            };
         self.expect(TokenKind::KwBy, "`by`")?;
         self.expect(TokenKind::LBracket, "`[`")?;
         let mut score_by = Vec::new();
         while !self.at(TokenKind::RBracket) {
             let cstart = self.peek().map(|t| t.span).unwrap_or(LexSpan::dummy());
+            // Optional weight: `0.6: field desc` or just `field desc`
+            let weight = if (self.at(TokenKind::Decimal) || self.at(TokenKind::Int))
+                && self.peek2().map(|t| t.kind) == Some(TokenKind::Colon)
+            {
+                let w = self.parse_expr()?;
+                self.expect(TokenKind::Colon, "`:`")?;
+                Some(w)
+            } else {
+                None
+            };
             let field = self.path()?;
             let dir = if self.at(TokenKind::Ident)
                 && self.peek().map(|t| t.text.as_str()) == Some("desc")
@@ -1933,6 +1966,7 @@ impl Parser {
             let cend = self.peek().map(|t| t.span).unwrap_or(cstart);
             score_by.push(ScoreClause {
                 span: self.span_from(cstart, cend),
+                weight,
                 field,
                 dir,
             });

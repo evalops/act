@@ -228,7 +228,7 @@ fn lower_stmt(
             id
         }
         Stmt::Defer { body, .. } => lower_block(body, nodes, next, diags),
-        Stmt::Require(e) | Stmt::Check(e) | Stmt::Ensure(e) => lower_expr(e, nodes, next, diags),
+        Stmt::Require(e) | Stmt::Check { cond: e, .. } | Stmt::Ensure(e) => lower_expr(e, nodes, next, diags),
         Stmt::Trace { fields, .. } => {
             let mut children = Vec::new();
             for (_, v) in fields {

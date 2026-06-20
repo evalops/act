@@ -9,3 +9,7 @@ authors.workspace = true
 [dependencies]
 act-syntax.workspace = true
 act-diagnostics.workspace = true
+
+[dev-dependencies]
+act-parser.workspace = true
+act-ir.workspace = true
