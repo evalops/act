@@ -1,0 +1,20 @@
+[package]
+name = "actc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "actc"
+path = "src/main.rs"
+
+[dependencies]
+act-syntax.workspace = true
+act-parser.workspace = true
+act-diagnostics.workspace = true
+act-check.workspace = true
+act-ir.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,23 @@
+module smoke@0.1
+
+use tool github@2 as gh
+
+type Repo = {
+  owner: String,
+  name: String,
+}
+
+type Result<T, E> =
+  | ok(value: T)
+  | err(error: E)
+
+fn normalize_path(path: String) -> String {
+  path
+}
+
+proc fetch_logs(repo: Repo, run_id: String) -> Result<String, String>
+  effects [gh.read]
+{
+  let result = try gh.get_logs(repo: repo, id: run_id)
+  return ok(result)
+}

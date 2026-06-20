@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/act-syntax",
+  "crates/act-parser",
+  "crates/act-diagnostics",
+  "crates/act-check",
+  "crates/act-ir",
+  "crates/actc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/evalops/act"
+authors = ["EvalOps"]
+
+[workspace.dependencies]
+act-syntax = { path = "crates/act-syntax" }
+act-parser = { path = "crates/act-parser" }
+act-diagnostics = { path = "crates/act-diagnostics" }
+act-check = { path = "crates/act-check" }
+act-ir = { path = "crates/act-ir" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+debug = true
