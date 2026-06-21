@@ -316,3 +316,76 @@ task greet(name: String) -> Result<String, String>
         .expect("passed");
     assert!(passed);
 }
+
+#[test]
+fn dev_loop_runs_fix_regression_end_to_end() {
+    // Self-hosted dev loop: `examples/fix_regression.act` is the end-to-end
+    // task (parallel fetch, infer hypotheses, map patches, decide best, open
+    // PR, defer-compensate close, trace). Running it under the mock proves the
+    // full control flow works with the self-hosted verifier gating each infer.
+    let module = parse_module(include_str!("../../../examples/fix_regression.act"), 1)
+        .expect("fix_regression parses");
+
+    // Sequential `coder` responses: first the hypothesis array, then a
+    // PatchAttempt for each `await map` branch.
+    let h = MockHost::new()
+        .model(
+            "coder",
+            serde_json::json!([{
+                "claim": "off-by-one in counter",
+                "evidence": [{"source": "logs", "observed_at": "now"}],
+                "confidence": 0.8
+            }]),
+            0.8,
+        )
+        .model(
+            "coder",
+            serde_json::json!({
+                "hypothesis": {
+                    "claim": "off-by-one in counter",
+                    "evidence": [],
+                    "confidence": 0.8
+                },
+                "files_changed": ["src/counter.rs"],
+                "tests_passed": 10,
+                "tests_failed": 0,
+                "pass_rate": 1.0,
+                "confidence": 0.9
+            }),
+            0.9,
+        );
+
+    let cfg = RunConfig {
+        host: &h,
+        granted_caps: HashSet::new(),
+    };
+    let repo = Value::Record(vec![
+        ("owner".into(), Value::String("evalops".into())),
+        ("name".into(), Value::String("act".into())),
+    ]);
+    let input = Value::Record(vec![
+        ("repo".into(), repo),
+        ("run_id".into(), Value::String("42".into())),
+        ("base_sha".into(), Value::String("abc".into())),
+        ("head_sha".into(), Value::String("def".into())),
+    ]);
+    let result = run_task(&module, "fix_regression", vec![("input".into(), input)], &cfg)
+        .expect("fix_regression should run");
+
+    // Task returned ok(FixResult).
+    let fix = match result {
+        Value::Result {
+            ok: true,
+            value: Some(v),
+        } => *v,
+        other => panic!("expected ok FixResult, got {:?}", other),
+    };
+    let pr_url = fix.field("pr_url").and_then(|v| match v {
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    assert!(pr_url.is_some(), "FixResult has pr_url: {:?}", fix);
+    // The trace was recorded.
+    let trace = h.replay_trace("selected_root_cause").expect("trace recorded");
+    assert!(trace.field("claim").is_some());
+}

@@ -2,6 +2,7 @@
 //! responses keyed by path; state and traces are held in interior-mutable
 //! stores so the host stays `Send + Sync` for parallel `await all` branches.
 
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::host::{Host, HostError, InferRequest, InferResult, StateCell, ToolResult};
@@ -26,6 +27,11 @@ pub struct MockTool {
 pub struct MockHost {
     tools: Mutex<Vec<(String, MockTool)>>,
     models: Mutex<Vec<(String, MockInfer)>>,
+    /// Per-alias cursor so multiple canned responses for the same alias are
+    /// returned in registration order (sequential), then wrap. This lets tests
+    /// mock programs that call `infer` several times on one alias with
+    /// different target types.
+    model_cursor: Mutex<HashMap<String, usize>>,
     state: Mutex<Vec<(String, StateCell)>>,
     traces: Mutex<Vec<(String, Value)>>,
     start: std::time::Instant,
@@ -42,6 +48,7 @@ impl MockHost {
         MockHost {
             tools: Mutex::new(Vec::new()),
             models: Mutex::new(Vec::new()),
+            model_cursor: Mutex::new(HashMap::new()),
             state: Mutex::new(Vec::new()),
             traces: Mutex::new(Vec::new()),
             start: std::time::Instant::now(),
@@ -103,21 +110,35 @@ impl MockHost {
 
 impl Host for MockHost {
     fn infer(&self, model: &str, req: InferRequest) -> Result<InferResult, HostError> {
-        let canned = self
+        // Collect all canned responses for this alias, in registration order.
+        let matching: Vec<MockInfer> = self
             .models
             .lock()
             .unwrap()
             .iter()
-            .find(|(m, _)| m == model)
+            .filter(|(m, _)| m == model)
             .map(|(_, c)| MockInfer {
                 json: c.json.clone(),
                 confidence: c.confidence,
                 tokens: c.tokens,
                 cost: c.cost,
-            });
-        if let Some(c) = canned {
+            })
+            .collect();
+        if !matching.is_empty() {
+            // Sequential: return the next registered response for this alias,
+            // advancing the cursor (wraps if exhausted). This lets tests mock
+            // programs that call `infer` several times on one alias with
+            // different target types.
+            let idx = {
+                let mut cursors = self.model_cursor.lock().unwrap();
+                let c = cursors.entry(model.to_string()).or_insert(0);
+                let i = *c % matching.len();
+                *c += 1;
+                i
+            };
+            let c = &matching[idx];
             return Ok(InferResult {
-                json: c.json,
+                json: c.json.clone(),
                 confidence: c.confidence,
                 tokens: c.tokens,
                 cost: c.cost,

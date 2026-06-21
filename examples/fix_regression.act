@@ -120,7 +120,7 @@ task fix_regression(input: Input) -> Result<FixResult, FixError>
   check best.pass_rate >= 0.95 else {
     return err(low_confidence("Patch pass rate below 0.95"))
   }
-  check best.files_changed.len <= 20 else {
+  check best.files_changed.len() <= 20 else {
     return err(tool_failed("propose_patch", "Too many files changed"))
   }
 
