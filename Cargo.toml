@@ -7,6 +7,7 @@ members = [
   "crates/act-check",
   "crates/act-fmt",
   "crates/act-ir",
+  "crates/act-run",
   "crates/actc",
 ]
 
@@ -24,6 +25,7 @@ act-diagnostics = { path = "crates/act-diagnostics" }
 act-check = { path = "crates/act-check" }
 act-fmt = { path = "crates/act-fmt" }
 act-ir = { path = "crates/act-ir" }
+act-run = { path = "crates/act-run" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

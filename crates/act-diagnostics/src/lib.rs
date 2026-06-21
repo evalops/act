@@ -95,6 +95,7 @@ pub mod codes {
     pub const E_UNHANDLED_RESULT: &str = "E_UNHANDLED_RESULT";
     pub const E_POLICY_CONFLICT: &str = "E_POLICY_CONFLICT";
     pub const E_BUDGET_MISSING: &str = "E_BUDGET_MISSING";
+    pub const E_BUDGET_EXCEEDED: &str = "E_BUDGET_EXCEEDED";
     pub const E_HOLE_UNFILLED: &str = "E_HOLE_UNFILLED";
     pub const E_NONDETERMINISTIC_PURE_FN: &str = "E_NONDETERMINISTIC_PURE_FN";
     pub const E_TOOL_RETURN_UNVALIDATED: &str = "E_TOOL_RETURN_UNVALIDATED";
