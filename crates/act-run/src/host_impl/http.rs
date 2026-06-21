@@ -5,7 +5,17 @@
 //! error, so the runtime degrades gracefully instead of panicking.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
+
+use async_openai::{
+    config::OpenAIConfig as AiConfig,
+    types::{
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+        CreateChatCompletionRequestArgs,
+    },
+    Client,
+};
 
 use crate::host::{Host, HostError, InferRequest, InferResult, StateCell, ToolResult};
 use crate::value::{to_json, Value};
@@ -31,19 +41,38 @@ impl OpenAiConfig {
     }
 }
 
-/// A real HTTP host.
+/// A real HTTP host. Model calls go through `async-openai` (the canonical Rust
+/// client); `gh.*` tool calls go to the GitHub REST API via blocking `reqwest`.
+/// The interpreter is synchronous, so the async model client is driven by a
+/// tokio runtime held here (`Handle::block_on` from the host's sync methods).
 pub struct HttpHost {
-    openai: Option<OpenAiConfig>,
+    openai: Option<OpenAiClient>,
     github_token: Option<String>,
     state: std::sync::Mutex<HashMap<String, StateCell>>,
     traces: std::sync::Mutex<HashMap<String, Value>>,
     start: Instant,
 }
 
+struct OpenAiClient {
+    client: Arc<Client<AiConfig>>,
+    model: String,
+    rt: tokio::runtime::Runtime,
+}
+
 impl HttpHost {
     pub fn from_env() -> HttpHost {
+        let openai = OpenAiConfig::from_env().map(|cfg| {
+            let config = AiConfig::new()
+                .with_api_key(cfg.api_key.clone())
+                .with_api_base(cfg.base_url.clone());
+            OpenAiClient {
+                client: Arc::new(Client::with_config(config)),
+                model: cfg.model,
+                rt: tokio::runtime::Runtime::new().expect("build tokio runtime"),
+            }
+        });
         HttpHost {
-            openai: OpenAiConfig::from_env(),
+            openai,
             github_token: std::env::var("GITHUB_TOKEN").ok(),
             state: std::sync::Mutex::new(HashMap::new()),
             traces: std::sync::Mutex::new(HashMap::new()),
@@ -85,42 +114,54 @@ fn json_to_text(v: &Value) -> String {
 
 impl Host for HttpHost {
     fn infer(&self, model: &str, req: InferRequest) -> Result<InferResult, HostError> {
-        let cfg = self
+        let setup = self
             .openai
             .as_ref()
             .ok_or_else(|| HostError("no model credentials: OPENAI_API_KEY unset".into()))?;
+        // The Act `using <alias>` handle is not a real model name; the concrete
+        // model comes from OPENAI_MODEL (unless the source names one explicitly).
+        let model_name = if model.is_empty() {
+            setup.model.clone()
+        } else {
+            model.to_string()
+        };
         let prompt = self.prompt(&req);
-        let body = serde_json::json!({
-            "model": if model.is_empty() { cfg.model.clone() } else { model.to_string() },
-            "messages": [
-                {"role": "system", "content": "You are a structured-output agent. Always respond with JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-        });
-        let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-        let resp: serde_json::Value = blocking_post_json(
-            &url,
-            &body,
-            &[("Authorization", format!("Bearer {}", cfg.api_key))],
-        )?;
-        let content = resp
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .ok_or_else(|| HostError("malformed model response".into()))?;
-        let tokens = resp
-            .get("usage")
-            .and_then(|u| u.get("total_tokens"))
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0);
-        // Try to parse the content as JSON; fall back to wrapping it as a string.
-        let json = serde_json::from_str::<serde_json::Value>(content)
-            .unwrap_or_else(|_| serde_json::Value::String(content.to_string()));
+        let system = ChatCompletionRequestSystemMessageArgs::default()
+            .content("You are a structured-output agent. Always respond with JSON only.")
+            .build()
+            .map_err(|e| HostError(format!("build system message: {}", e)))?
+            .into();
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content(prompt)
+            .build()
+            .map_err(|e| HostError(format!("build user message: {}", e)))?
+            .into();
+        let request = CreateChatCompletionRequestArgs::default()
+            .model(&model_name)
+            .messages([system, user])
+            .build()
+            .map_err(|e| HostError(format!("build chat request: {}", e)))?;
+        let client = setup.client.clone();
+        let response = setup
+            .rt
+            .handle()
+            .block_on(async move { client.chat().create(request).await })
+            .map_err(|e| HostError(format!("model request failed: {}", e)))?;
+        let content = response
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .ok_or_else(|| HostError("model returned no content".into()))?;
+        let tokens = response.usage.map(|u| u.total_tokens as u64).unwrap_or(0);
+        // Parse the content as JSON; fall back to wrapping it as a string.
+        let json = serde_json::from_str::<serde_json::Value>(&content)
+            .unwrap_or(serde_json::Value::String(content));
         Ok(InferResult {
             json,
-            confidence: 1.0, // no native confidence from chat APIs; gate accordingly
+            // Chat APIs don't return calibrated confidence; the accept gate
+            // should be set conservatively or use a verifier-derived score.
+            confidence: 1.0,
             tokens,
             cost: 0.0,
         })

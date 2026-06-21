@@ -14,6 +14,8 @@ act-diagnostics.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+async-openai = "0.27"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 act-fmt.workspace = true

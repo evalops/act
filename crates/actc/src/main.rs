@@ -10,6 +10,8 @@ fn main() -> ExitCode {
         eprintln!("  parse <file.act>       parse only, print AST summary");
         eprintln!("  lower <file.act>       parse + check + lower to graph IR, print JSON");
         eprintln!("  fmt   <file.act>       parse + format to canonical source");
+        eprintln!("  run   <file.act> <task> [name=json ...]  parse + check + execute against");
+        eprintln!("                                     real models/tools (needs OPENAI_API_KEY, GITHUB_TOKEN)");
         eprintln!("  lex   <file.act>       lex only, print tokens");
         return ExitCode::from(2);
     }
@@ -116,6 +118,60 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "run" => {
+            let task = match args.get(3) {
+                Some(t) => t.clone(),
+                None => {
+                    eprintln!("usage: actc run <file.act> <task> [name=json ...]");
+                    return ExitCode::from(2);
+                }
+            };
+            let module = match act_parser::parse_module(&src, file_id) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("parse error: {} at {:?}", e.message, e.span);
+                    return ExitCode::from(1);
+                }
+            };
+            let chk = act_check::check(&module);
+            if !chk.report.ok {
+                println!("{}", serde_json::to_string_pretty(&chk.report).unwrap());
+                return ExitCode::from(1);
+            }
+            // Remaining args are `name=json` pairs bound to task params.
+            let mut run_args: Vec<(String, act_run::Value)> = Vec::new();
+            for a in args.iter().skip(4) {
+                match a.split_once('=') {
+                    Some((k, v)) => {
+                        let json: serde_json::Value = serde_json::from_str(v)
+                            .unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
+                        let val = act_run::value_from_json(&json);
+                        run_args.push((k.to_string(), val));
+                    }
+                    None => {
+                        run_args.push((a.clone(), act_run::Value::String(a.clone())));
+                    }
+                }
+            }
+            let host = act_run::HttpHost::from_env();
+            let cfg = act_run::RunConfig {
+                host: &host,
+                granted_caps: std::collections::HashSet::new(),
+            };
+            match act_run::run_task(&module, &task, run_args, &cfg) {
+                Ok(v) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&act_run::to_json(&v)).unwrap()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("run error: {}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
         other => {
             eprintln!("unknown command: {}", other);
             ExitCode::from(2)

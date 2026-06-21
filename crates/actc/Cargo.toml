@@ -17,5 +17,6 @@ act-diagnostics.workspace = true
 act-check.workspace = true
 act-fmt.workspace = true
 act-ir.workspace = true
+act-run.workspace = true
 serde.workspace = true
 serde_json.workspace = true

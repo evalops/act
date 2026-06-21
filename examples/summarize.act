@@ -1,0 +1,30 @@
+module summarize@0.1
+
+use model codegen@1 as coder
+
+type Repo = {
+  owner: String,
+  name: String,
+}
+
+type Summary = {
+  text: String,
+}
+
+// Reads a file from GitHub and asks the model to summarize it.
+// Runnable end-to-end:
+//   OPENAI_API_KEY=... GITHUB_TOKEN=... \
+//     actc run examples/summarize.act summarize \
+//       repo='{"owner":"evalops","name":"act"}' path='"README.md"'
+task summarize(repo: Repo, path: String) -> Result<Summary, String>
+  effects [gh.read, model]
+{
+  let content = try gh.get_file(repo: repo, path: path)
+  let summary = infer Summary using coder {
+    goal: "Summarize this file in one sentence."
+    input: content
+  } accept {
+    confidence >= 0.0,
+  }
+  return ok(summary)
+}

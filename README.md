@@ -17,7 +17,10 @@ built around model calls as first-class expressions.
 
 ## Status
 
-Pre-alpha. The kernel is being built incrementally. Nothing runs end to end yet.
+Pre-alpha. The compiler kernel (lexer, parser, checker, formatter, IR) is
+complete, and `act-run` executes tasks end to end against real models and tools.
+A runner/scheduler for long-lived durability (checkpoint resume, replay
+storage beyond the process) is the main thing still missing.
 
 ## Kernel scope (v1)
 
@@ -53,6 +56,7 @@ crates/
   act-check        type, effect, capability, taint, budget checking
   act-fmt          canonical formatter (AST -> source, idempotent)
   act-ir           lowering to executable graph IR
+  act-run          AST-interpreter runtime + Host (mock / HTTP)
   actc             CLI
 ```
 
@@ -89,6 +93,29 @@ actc parse <file.act>   # parse, print a module summary
 actc check <file.act>   # parse + check, print JSON diagnostics
 actc lower <file.act>   # parse + check + lower to graph IR, print JSON
 actc fmt   <file.act>   # parse + format to canonical source
+```
+
+## Runtime
+
+`act-run` interprets the AST (the IR drops executable detail, so it stays a
+structural artifact). It enforces the same guarantees at runtime that the
+checker proves statically: budgets (wall time, tokens, cost, tool calls),
+optimistic-concurrency state writes, capabilities, and `defer compensate` on
+scope exit. `await all` branches run on separate OS threads sharing one atomic
+budget counter. `trace` records to the host; `replay trace("X")` reads it back.
+
+Models and tools are pluggable behind a `Host` trait. `HttpHost` calls real
+OpenAI-compatible models (via `async-openai`) and dispatches `gh.*` calls to the
+GitHub REST API. Credentials come from the environment.
+
+```sh
+# A task that needs no external calls:
+actc run examples/<file>.act <task> name=value ...
+
+# Against a real model + GitHub (summarize a file):
+OPENAI_API_KEY=... GITHUB_TOKEN=... \
+  actc run examples/summarize.act summarize \
+    repo='{"owner":"evalops","name":"act"}' path='"README.md"'
 ```
 
 ## Example

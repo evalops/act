@@ -199,6 +199,12 @@ fn coerce_decl(decl: &TypeDecl, json: &Json, types: &TypeRegistry) -> Result<Val
 }
 
 fn coerce_fallback(json: &Json) -> Value {
+    value_from_json(json)
+}
+
+/// Convert a JSON value into a runtime `Value` without type guidance
+/// (used for CLI args and host-supplied inputs).
+pub fn value_from_json(json: &Json) -> Value {
     match json {
         Json::Null => Value::Null,
         Json::Bool(b) => Value::Bool(*b),
@@ -208,10 +214,10 @@ fn coerce_fallback(json: &Json) -> Value {
             .or_else(|| n.as_f64().map(Value::Decimal))
             .unwrap_or(Value::Null),
         Json::String(s) => Value::String(s.clone()),
-        Json::Array(a) => Value::Array(a.iter().map(coerce_fallback).collect()),
+        Json::Array(a) => Value::Array(a.iter().map(value_from_json).collect()),
         Json::Object(o) => Value::Record(
-            o.into_iter()
-                .map(|(k, v)| (k.clone(), coerce_fallback(v)))
+            o.iter()
+                .map(|(k, v)| (k.clone(), value_from_json(v)))
                 .collect(),
         ),
     }
