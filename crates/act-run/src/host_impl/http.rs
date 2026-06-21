@@ -1,24 +1,32 @@
 //! HTTP host: calls real OpenAI-compatible models and dispatches `gh.*` tool
 //! calls to the GitHub REST API. Credentials come from the environment
-//! (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `GITHUB_TOKEN`).
-//! When a credential is absent, the corresponding capability returns a host
-//! error, so the runtime degrades gracefully instead of panicking.
+//! (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_VERIFIER_MODEL`,
+//! `GITHUB_TOKEN`). When a credential is absent, the corresponding capability
+//! returns a host error, so the runtime degrades gracefully instead of panicking.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_openai::{
     config::OpenAIConfig as AiConfig,
     types::{
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs,
+        CreateChatCompletionRequestArgs, ResponseFormat, ResponseFormatJsonSchema,
     },
     Client,
 };
 
-use crate::host::{Host, HostError, InferRequest, InferResult, StateCell, ToolResult};
+use crate::host::{
+    Host, HostError, InferRequest, InferResult, StateCell, ToolResult, VerifyRequest, VerifyResult,
+};
 use crate::value::{to_json, Value};
+
+/// Per-token cost in USD for cost tracking. Micros per token.
+/// Defaults to gpt-4o-mini pricing (~$0.15/1M input, ~$0.60/1M output);
+/// override via `OPENAI_COST_PER_1K_TOKENS` (in micros, i.e. millionths of a
+/// dollar per 1K tokens).
+const DEFAULT_COST_PER_1K_TOKENS_MICROS: u64 = 150;
 
 /// Configuration for an OpenAI-compatible chat-completions endpoint.
 #[derive(Clone)]
@@ -26,17 +34,28 @@ pub struct OpenAiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Optional separate model for the verifier call. Defaults to `model`.
+    pub verifier_model: String,
+    /// Cost per 1K tokens in micros (millionths of a USD).
+    pub cost_per_1k_tokens_micros: u64,
 }
 
 impl OpenAiConfig {
     /// Read from the environment. Returns `None` if `OPENAI_API_KEY` is unset.
     pub fn from_env() -> Option<OpenAiConfig> {
         let api_key = std::env::var("OPENAI_API_KEY").ok()?;
+        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
         Some(OpenAiConfig {
             base_url: std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
             api_key,
-            model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+            verifier_model: std::env::var("OPENAI_VERIFIER_MODEL")
+                .unwrap_or_else(|_| model.clone()),
+            cost_per_1k_tokens_micros: std::env::var("OPENAI_COST_PER_1K_TOKENS_MICROS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_COST_PER_1K_TOKENS_MICROS),
+            model,
         })
     }
 }
@@ -57,6 +76,8 @@ pub struct HttpHost {
 struct OpenAiClient {
     client: Arc<Client<AiConfig>>,
     model: String,
+    verifier_model: String,
+    cost_per_1k_tokens_micros: u64,
     rt: tokio::runtime::Runtime,
 }
 
@@ -69,6 +90,8 @@ impl HttpHost {
             OpenAiClient {
                 client: Arc::new(Client::with_config(config)),
                 model: cfg.model,
+                verifier_model: cfg.verifier_model,
+                cost_per_1k_tokens_micros: cfg.cost_per_1k_tokens_micros,
                 rt: tokio::runtime::Runtime::new().expect("build tokio runtime"),
             }
         });
@@ -83,6 +106,9 @@ impl HttpHost {
         }
     }
 
+    /// Build the user prompt from the goal/input/constraints. The type shape
+    /// is enforced server-side via `response_format`, so the prompt only needs
+    /// the task context — not a description of the JSON shape.
     fn prompt(&self, req: &InferRequest) -> String {
         let mut s = String::new();
         if let Some(g) = req.goal {
@@ -103,13 +129,32 @@ impl HttpHost {
                 s.push('\n');
             }
         }
-        if let Some(schema) = req.ty_schema {
-            s.push_str("Respond with only valid JSON matching this shape: ");
-            s.push_str(schema);
+        s.push_str("Respond with valid JSON only.");
+        s
+    }
+
+    /// Build a verify prompt: the verifier sees the goal, input, and the
+    /// candidate output, and must return { "confidence": 0.0-1.0, "reason": "..." }.
+    fn verify_prompt(&self, req: &VerifyRequest) -> String {
+        let mut s = String::new();
+        if let Some(g) = req.goal {
+            s.push_str("Goal: ");
+            s.push_str(&json_to_text(g));
             s.push('\n');
-        } else {
-            s.push_str("Respond with only valid JSON for the requested type.");
         }
+        if let Some(i) = req.input {
+            s.push_str("Input: ");
+            s.push_str(&serde_json::to_string_pretty(&to_json(i)).unwrap_or_default());
+            s.push('\n');
+        }
+        for c in req.constraints {
+            s.push_str("- ");
+            s.push_str(&json_to_text(c));
+            s.push('\n');
+        }
+        s.push_str("Candidate output to verify:\n");
+        s.push_str(&serde_json::to_string_pretty(&to_json(req.output)).unwrap_or_default());
+        s.push_str("\n\nEvaluate whether the candidate output correctly satisfies the goal given the input. Respond with JSON: { \"confidence\": <0.0-1.0>, \"reason\": \"<brief explanation>\" }");
         s
     }
 }
@@ -121,16 +166,74 @@ fn json_to_text(v: &Value) -> String {
     }
 }
 
+/// Compute cost in USD from token count and per-1K-token rate (in micros).
+fn cost_for_tokens(per_1k_micros: u64, tokens: u64) -> f64 {
+    (tokens as f64 / 1000.0) * (per_1k_micros as f64 / 1_000_000.0)
+}
+
+/// Send a chat completion request with retry on transient errors (429, 500+)
+/// and a fallback if the provider doesn't support `response_format: json_schema`.
+/// `use_schema` tracks whether the original request used structured output;
+/// on a 400 suggesting `response_format` is unsupported, retry with the schema
+/// removed (the prompt still asks for JSON).
+fn chat_with_retry(
+    rt: &tokio::runtime::Runtime,
+    client: Arc<Client<AiConfig>>,
+    request: async_openai::types::CreateChatCompletionRequest,
+    use_schema: bool,
+    schema: &Option<serde_json::Value>,
+) -> Result<async_openai::types::CreateChatCompletionResponse, String> {
+    let max_retries = 3u32;
+    let mut delay = Duration::from_millis(500);
+    let mut last_err = String::new();
+    let mut current_req = request;
+    let mut schema_dropped = false;
+    for attempt in 0..=max_retries {
+        let c = client.clone();
+        let req = current_req.clone();
+        let result = rt
+            .handle()
+            .block_on(async move { c.chat().create(req).await });
+        match result {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                let estr = format!("{}", e);
+                last_err = estr.clone();
+                // If the provider rejected `response_format: json_schema`
+                // (common for older / non-OpenAI providers), retry without it.
+                if use_schema
+                    && !schema_dropped
+                    && (estr.contains("response_format") || estr.contains("400"))
+                {
+                    current_req.response_format = None;
+                    schema_dropped = true;
+                    continue;
+                }
+                // Retry on rate-limit (429) or server errors (5xx).
+                let should_retry = estr.contains("429")
+                    || estr.contains("500")
+                    || estr.contains("502")
+                    || estr.contains("503")
+                    || estr.contains("504");
+                if should_retry && attempt < max_retries {
+                    std::thread::sleep(delay);
+                    delay *= 2;
+                    continue;
+                }
+                return Err(last_err);
+            }
+        }
+    }
+    let _ = schema;
+    Err(last_err)
+}
+
 impl Host for HttpHost {
     fn infer(&self, model: &str, req: InferRequest) -> Result<InferResult, HostError> {
         let setup = self
             .openai
             .as_ref()
             .ok_or_else(|| HostError("no model credentials: OPENAI_API_KEY unset".into()))?;
-        // The Act `using <alias>` handle is a source-level handle, not a model
-        // ID. The concrete model always comes from OPENAI_MODEL. (A future
-        // `extern model` registry could resolve aliases to real IDs; until then
-        // sending the alias would 400 against any real provider.)
         let _ = model;
         let model_name = setup.model.clone();
         let prompt = self.prompt(&req);
@@ -144,19 +247,31 @@ impl Host for HttpHost {
             .build()
             .map_err(|e| HostError(format!("build user message: {}", e)))?
             .into();
-        let request = CreateChatCompletionRequestArgs::default()
+        // If the host provided a JSON Schema for the target type, use
+        // `response_format: { type: "json_schema", strict: true }` so the
+        // provider guarantees the shape server-side. This eliminates the
+        // silent field-drop coercion bug. Not all providers support this;
+        // a 400 on this field means the provider doesn't — fall back to
+        // no schema on retry (the prompt still asks for JSON).
+        let schema = req.ty_schema.cloned();
+        let use_schema = schema.is_some();
+        let response_format = schema.as_ref().map(|s| ResponseFormat::JsonSchema {
+            json_schema: ResponseFormatJsonSchema {
+                name: "act_infer_output".to_string(),
+                description: None,
+                schema: Some(s.clone()),
+                strict: Some(true),
+            },
+        });
+        let mut request = CreateChatCompletionRequestArgs::default()
             .model(&model_name)
             .messages([system, user])
-            // Request token logprobs so the accept gate has a real signal
-            // (mean chosen-token probability) instead of an always-pass placeholder.
             .logprobs(true)
             .build()
             .map_err(|e| HostError(format!("build chat request: {}", e)))?;
+        request.response_format = response_format;
         let client = setup.client.clone();
-        let response = setup
-            .rt
-            .handle()
-            .block_on(async move { client.chat().create(request).await })
+        let response = chat_with_retry(&setup.rt, client, request, use_schema, &schema)
             .map_err(|e| HostError(format!("model request failed: {}", e)))?;
         let choice = response
             .choices
@@ -168,35 +283,110 @@ impl Host for HttpHost {
             .content
             .ok_or(HostError("model returned no content".into()))?;
         let tokens = response.usage.map(|u| u.total_tokens as u64).unwrap_or(0);
-        // Confidence = geometric mean of chosen-token probabilities. This is a
-        // token-level proxy, not a calibrated answer-confidence; treat it as a
-        // coarse gate and prefer a verifier-derived score where it matters.
+        // Token-logprob confidence is a fluency proxy, not correctness. The
+        // verifier gate (see `verify`) is the real signal; this is kept as a
+        // secondary heuristic.
         let confidence = choice
             .logprobs
             .and_then(|lp| lp.content)
-            .map(|tokens| {
-                if tokens.is_empty() {
+            .map(|toks| {
+                if toks.is_empty() {
                     return 1.0;
                 }
                 let mean_logprob: f64 =
-                    tokens.iter().map(|t| t.logprob as f64).sum::<f64>() / tokens.len() as f64;
+                    toks.iter().map(|t| t.logprob as f64).sum::<f64>() / toks.len() as f64;
                 mean_logprob.exp()
             })
             .unwrap_or(1.0);
-        // Parse the content as JSON; fall back to wrapping it as a string.
         let json = serde_json::from_str::<serde_json::Value>(&content)
             .unwrap_or(serde_json::Value::String(content));
+        let cost = cost_for_tokens(setup.cost_per_1k_tokens_micros, tokens);
         Ok(InferResult {
             json,
             confidence,
             tokens,
-            cost: 0.0,
+            cost,
+        })
+    }
+
+    fn verify(&self, model: &str, req: VerifyRequest) -> Result<VerifyResult, HostError> {
+        let setup = self
+            .openai
+            .as_ref()
+            .ok_or_else(|| HostError("no model credentials: OPENAI_API_KEY unset".into()))?;
+        let _ = model;
+        let model_name = setup.verifier_model.clone();
+        let prompt = self.verify_prompt(&req);
+        let system = ChatCompletionRequestSystemMessageArgs::default()
+            .content("You are a verification agent. Evaluate the candidate output and respond with JSON only.")
+            .build()
+            .map_err(|e| HostError(format!("build verify system message: {}", e)))?
+            .into();
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content(prompt)
+            .build()
+            .map_err(|e| HostError(format!("build verify user message: {}", e)))?
+            .into();
+        // The verifier always returns { "confidence": number, "reason": string }.
+        let verifier_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "confidence": {"type": "number"},
+                "reason": {"type": "string"}
+            },
+            "required": ["confidence", "reason"],
+            "additionalProperties": false
+        });
+        let request = CreateChatCompletionRequestArgs::default()
+            .model(&model_name)
+            .messages([system, user])
+            .response_format(ResponseFormat::JsonSchema {
+                json_schema: ResponseFormatJsonSchema {
+                    name: "act_verify_output".to_string(),
+                    description: None,
+                    schema: Some(verifier_schema),
+                    strict: Some(true),
+                },
+            })
+            .build()
+            .map_err(|e| HostError(format!("build verify request: {}", e)))?;
+        let client = setup.client.clone();
+        let response = setup
+            .rt
+            .handle()
+            .block_on(async move { client.chat().create(request).await })
+            .map_err(|e| HostError(format!("verify request failed: {}", e)))?;
+        let choice = response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or(HostError("verifier returned no choice".into()))?;
+        let content = choice
+            .message
+            .content
+            .ok_or(HostError("verifier returned no content".into()))?;
+        let tokens = response.usage.map(|u| u.total_tokens as u64).unwrap_or(0);
+        let parsed: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| HostError(format!("verifier returned non-JSON: {}", e)))?;
+        let confidence = parsed
+            .get("confidence")
+            .and_then(|c| c.as_f64())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let cost = cost_for_tokens(setup.cost_per_1k_tokens_micros, tokens);
+        Ok(VerifyResult {
+            confidence,
+            tokens,
+            cost,
         })
     }
 
     fn call_tool(&self, path: &str, args: Vec<(String, Value)>) -> Result<ToolResult, HostError> {
         if let Some(rest) = path.strip_prefix("gh.") {
             return self.github(rest, &args);
+        }
+        if let Some(rest) = path.strip_prefix("eo.") {
+            return self.evalops(rest, &args);
         }
         Err(HostError(format!(
             "no HTTP dispatch configured for tool `{}`",
@@ -305,10 +495,16 @@ impl HttpHost {
         match op {
             "create_pull_request" => {
                 let repo = arg("repo").unwrap_or(Value::Null);
+                let base = text_arg(args, "base");
+                let base = if base.is_empty() {
+                    "main".to_string()
+                } else {
+                    base
+                };
                 let body = serde_json::json!({
                     "title": text_arg(args, "title"),
                     "head": text_arg(args, "branch"),
-                    "base": "main",
+                    "base": base,
                     "body": text_arg(args, "body"),
                 });
                 let url = format!("{}/repos/{}/pulls", self.github_api_base, repo_full(&repo));
@@ -321,6 +517,25 @@ impl HttpHost {
                 Ok(ToolResult {
                     ok: true,
                     value: Value::String(html),
+                })
+            }
+            "close_pull_request" => {
+                let repo = arg("repo").unwrap_or(Value::Null);
+                let pr_number = text_arg(args, "number");
+                if pr_number.is_empty() {
+                    return Err(HostError("close_pull_request requires `number`".into()));
+                }
+                let url = format!(
+                    "{}/repos/{}/pulls/{}",
+                    self.github_api_base,
+                    repo_full(&repo),
+                    pr_number
+                );
+                let body = serde_json::json!({"state": "closed"});
+                let _ = blocking_patch_json(&url, &body, &headers)?;
+                Ok(ToolResult {
+                    ok: true,
+                    value: Value::String("closed".to_string()),
                 })
             }
             "get_file" => {
@@ -356,17 +571,225 @@ impl HttpHost {
                     head
                 );
                 let resp = blocking_get_json(&url, &headers)?;
-                Ok(ToolResult {
-                    ok: true,
-                    value: Value::String(
+                // Return the patch/diff text, not just the html_url — the
+                // model needs to see what changed.
+                let diff = resp
+                    .get("files")
+                    .and_then(|files| files.as_array())
+                    .map(|files| {
+                        files
+                            .iter()
+                            .map(|f| {
+                                let filename =
+                                    f.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                                let patch = f.get("patch").and_then(|v| v.as_str()).unwrap_or("");
+                                format!("--- {}\n{}", filename, patch)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_else(|| {
                         resp.get("html_url")
                             .and_then(|u| u.as_str())
                             .unwrap_or("compare")
-                            .to_string(),
-                    ),
+                            .to_string()
+                    });
+                Ok(ToolResult {
+                    ok: true,
+                    value: Value::String(diff),
+                })
+            }
+            "get_logs" => {
+                // Fetch workflow run logs via the GitHub Actions API.
+                // GET /repos/{owner}/{repo}/actions/runs/{run_id}/logs returns
+                // a redirect to a zip URL; we return the run's job logs as
+                // a concatenated string.
+                let repo = arg("repo").unwrap_or(Value::Null);
+                let run_id = text_arg(args, "id");
+                if run_id.is_empty() {
+                    return Err(HostError("get_logs requires `id` (run_id)".into()));
+                }
+                let url = format!(
+                    "{}/repos/{}/actions/runs/{}/jobs",
+                    self.github_api_base,
+                    repo_full(&repo),
+                    run_id
+                );
+                let resp = blocking_get_json(&url, &headers)?;
+                let logs = resp
+                    .get("jobs")
+                    .and_then(|jobs| jobs.as_array())
+                    .map(|jobs| {
+                        jobs.iter()
+                            .map(|job| {
+                                let name =
+                                    job.get("name").and_then(|v| v.as_str()).unwrap_or("job");
+                                let conclusion = job
+                                    .get("conclusion")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let steps = job
+                                    .get("steps")
+                                    .and_then(|s| s.as_array())
+                                    .map(|steps| {
+                                        steps
+                                            .iter()
+                                            .map(|s| {
+                                                let sn = s
+                                                    .get("name")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("");
+                                                let sc = s
+                                                    .get("conclusion")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("?");
+                                                format!("  - [{}] {}", sc, sn)
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    })
+                                    .unwrap_or_default();
+                                format!("[{}] {}\n{}", conclusion, name, steps)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n")
+                    })
+                    .unwrap_or_default();
+                Ok(ToolResult {
+                    ok: true,
+                    value: Value::String(logs),
                 })
             }
             _ => Err(HostError(format!("unsupported GitHub op `{}`", op))),
+        }
+    }
+
+    /// Dispatch `eo.*` (evalops) tool calls. These read CI/test results from
+    /// the GitHub Actions API — `fetch_logs` and `failing_tests` map to the
+    /// same run-jobs endpoint, just sliced differently.
+    fn evalops(&self, op: &str, args: &[(String, Value)]) -> Result<ToolResult, HostError> {
+        let token = self.github_token.as_ref().ok_or_else(|| {
+            HostError("no GitHub credentials for eo.*: GITHUB_TOKEN unset".into())
+        })?;
+        let arg = |name: &str| args.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+        let repo_full = |v: &Value| -> String {
+            if let Value::Record(fs) = v {
+                let owner = fs.iter().find(|(n, _)| n == "owner").and_then(|(_, v)| {
+                    if let Value::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                });
+                let name = fs.iter().find(|(n, _)| n == "name").and_then(|(_, v)| {
+                    if let Value::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                });
+                match (owner, name) {
+                    (Some(o), Some(n)) => format!("{}/{}", o, n),
+                    _ => String::new(),
+                }
+            } else if let Value::String(s) = v {
+                s.clone()
+            } else {
+                String::new()
+            }
+        };
+        let headers = vec![
+            ("Authorization", format!("Bearer {}", token)),
+            ("Accept", "application/vnd.github+json".to_string()),
+            ("X-GitHub-Api-Version", "2022-11-28".to_string()),
+        ];
+        match op {
+            "fetch_logs" => {
+                let repo = arg("repo").unwrap_or(Value::Null);
+                let run_id = text_arg(args, "run_id");
+                if run_id.is_empty() {
+                    return Err(HostError("fetch_logs requires `run_id`".into()));
+                }
+                let url = format!(
+                    "{}/repos/{}/actions/runs/{}/jobs",
+                    self.github_api_base,
+                    repo_full(&repo),
+                    run_id
+                );
+                let resp = blocking_get_json(&url, &headers)?;
+                let logs = resp
+                    .get("jobs")
+                    .and_then(|jobs| jobs.as_array())
+                    .map(|jobs| {
+                        jobs.iter()
+                            .map(|job| {
+                                let name =
+                                    job.get("name").and_then(|v| v.as_str()).unwrap_or("job");
+                                let conclusion = job
+                                    .get("conclusion")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                format!("[{}] {}", conclusion, name)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                Ok(ToolResult {
+                    ok: true,
+                    value: Value::String(logs),
+                })
+            }
+            "failing_tests" => {
+                let repo = arg("repo").unwrap_or(Value::Null);
+                let run_id = text_arg(args, "run_id");
+                if run_id.is_empty() {
+                    return Err(HostError("failing_tests requires `run_id`".into()));
+                }
+                let url = format!(
+                    "{}/repos/{}/actions/runs/{}/jobs",
+                    self.github_api_base,
+                    repo_full(&repo),
+                    run_id
+                );
+                let resp = blocking_get_json(&url, &headers)?;
+                let failures: Vec<String> = resp
+                    .get("jobs")
+                    .and_then(|jobs| jobs.as_array())
+                    .map(|jobs| {
+                        jobs.iter()
+                            .flat_map(|job| {
+                                job.get("steps")
+                                    .and_then(|s| s.as_array())
+                                    .map(|steps| {
+                                        steps
+                                            .iter()
+                                            .filter(|s| {
+                                                s.get("conclusion").and_then(|v| v.as_str())
+                                                    == Some("failure")
+                                            })
+                                            .map(|s| {
+                                                s.get("name")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("unknown")
+                                                    .to_string()
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default()
+                                    .into_iter()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(ToolResult {
+                    ok: true,
+                    value: Value::Array(
+                        failures.iter().map(|s| Value::String(s.clone())).collect(),
+                    ),
+                })
+            }
+            _ => Err(HostError(format!("unsupported evalops op `{}`", op))),
         }
     }
 }
@@ -389,39 +812,43 @@ fn blocking_post_json(
     body: &serde_json::Value,
     headers: &[(&str, String)],
 ) -> Result<serde_json::Value, HostError> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("act-runtime/0.1")
-        .build()
-        .map_err(|e| HostError(format!("http client build failed: {}", e)))?;
-    let mut req = client.post(url).json(body);
-    for (k, v) in headers {
-        req = req.header(*k, v);
-    }
-    let resp = req
-        .send()
-        .map_err(|e| HostError(format!("request failed: {}", e)))?;
-    let status = resp.status();
-    let json: serde_json::Value = serde_json::from_str(
-        &resp
-            .text()
-            .map_err(|e| HostError(format!("read body: {}", e)))?,
-    )
-    .map_err(|e| HostError(format!("decode json: {}", e)))?;
-    if !status.is_success() {
-        return Err(HostError(format!("HTTP {}: {}", status, json)));
-    }
-    Ok(json)
+    blocking_send("POST", url, Some(body), headers)
+}
+
+fn blocking_patch_json(
+    url: &str,
+    body: &serde_json::Value,
+    headers: &[(&str, String)],
+) -> Result<serde_json::Value, HostError> {
+    blocking_send("PATCH", url, Some(body), headers)
 }
 
 fn blocking_get_json(
     url: &str,
     headers: &[(&str, String)],
 ) -> Result<serde_json::Value, HostError> {
+    blocking_send("GET", url, None, headers)
+}
+
+fn blocking_send(
+    method: &str,
+    url: &str,
+    body: Option<&serde_json::Value>,
+    headers: &[(&str, String)],
+) -> Result<serde_json::Value, HostError> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("act-runtime/0.1")
         .build()
         .map_err(|e| HostError(format!("http client build failed: {}", e)))?;
-    let mut req = client.get(url);
+    let mut req = match method {
+        "POST" => client.post(url),
+        "PATCH" => client.patch(url),
+        "GET" => client.get(url),
+        other => return Err(HostError(format!("unsupported method: {}", other))),
+    };
+    if let Some(b) = body {
+        req = req.json(b);
+    }
     for (k, v) in headers {
         req = req.header(*k, v);
     }
@@ -429,12 +856,11 @@ fn blocking_get_json(
         .send()
         .map_err(|e| HostError(format!("request failed: {}", e)))?;
     let status = resp.status();
-    let json: serde_json::Value = serde_json::from_str(
-        &resp
-            .text()
-            .map_err(|e| HostError(format!("read body: {}", e)))?,
-    )
-    .map_err(|e| HostError(format!("decode json: {}", e)))?;
+    let text = resp
+        .text()
+        .map_err(|e| HostError(format!("read body: {}", e)))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| HostError(format!("decode json: {} (body: {})", e, text)))?;
     if !status.is_success() {
         return Err(HostError(format!("HTTP {}: {}", status, json)));
     }

@@ -13,11 +13,15 @@ pub mod host;
 pub mod host_impl;
 pub mod interp;
 pub mod registry;
+pub mod schema;
 pub mod value;
 
-pub use host::{Host, HostError, InferRequest, InferResult, StateCell, ToolResult};
+pub use host::{
+    Host, HostError, InferRequest, InferResult, StateCell, ToolResult, VerifyRequest, VerifyResult,
+};
 pub use host_impl::{HttpHost, MockHost, OpenAiConfig};
 pub use interp::{run_eval, run_task, RunConfig, RunError};
+pub use registry::{FnRegistry, TypeRegistry};
 pub use value::{coerce, from_literal, to_json, value_from_json, Value};
 
 pub use act_diagnostics::codes;

@@ -20,15 +20,32 @@ pub struct InferRequest<'a> {
     pub goal: Option<&'a Value>,
     pub input: Option<&'a Value>,
     pub constraints: &'a [Value],
-    /// A compact rendering of the target type (e.g. `{ text: String }`),
-    /// so the host can tell the model what shape to return. `None` for
-    /// mock/test hosts that don't need it.
-    pub ty_schema: Option<&'a str>,
+    /// A JSON Schema describing the target type, for providers that support
+    /// `response_format: { type: "json_schema" }`. `None` on mock/test hosts.
+    pub ty_schema: Option<&'a serde_json::Value>,
 }
 
 /// A model's response, before type-directed coercion.
 pub struct InferResult {
     pub json: serde_json::Value,
+    pub confidence: f64,
+    pub tokens: u64,
+    pub cost: f64,
+}
+
+/// A request to verify a prior model output.
+pub struct VerifyRequest<'a> {
+    /// The original goal/input/constraints (same as the infer request).
+    pub goal: Option<&'a Value>,
+    pub input: Option<&'a Value>,
+    pub constraints: &'a [Value],
+    /// The model's output to verify.
+    pub output: &'a Value,
+}
+
+/// A verifier's verdict.
+pub struct VerifyResult {
+    /// 0.0–1.0: the verifier's confidence that `output` is correct.
     pub confidence: f64,
     pub tokens: u64,
     pub cost: f64,
@@ -49,6 +66,19 @@ pub struct StateCell {
 pub trait Host: Send + Sync {
     /// Run a model inference. `model` is the alias/path from `using`.
     fn infer(&self, model: &str, req: InferRequest) -> Result<InferResult, HostError>;
+
+    /// Verify a prior model output with a second model call. Returns a
+    /// confidence score (0.0–1.0) that the output is correct. The default
+    /// implementation returns the same confidence (no-op), so mock hosts and
+    /// hosts without a verifier model fall back gracefully.
+    fn verify(&self, model: &str, req: VerifyRequest) -> Result<VerifyResult, HostError> {
+        let _ = (model, req);
+        Ok(VerifyResult {
+            confidence: 1.0,
+            tokens: 0,
+            cost: 0.0,
+        })
+    }
 
     /// Invoke a tool by dotted path (e.g. `gh.create_pull_request`).
     fn call_tool(&self, path: &str, args: Vec<(String, Value)>) -> Result<ToolResult, HostError>;
