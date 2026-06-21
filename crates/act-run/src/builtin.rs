@@ -23,3 +23,14 @@ pub fn verify_act() -> &'static Module {
             .expect("builtin verify.act must parse")
     })
 }
+
+/// The parsed `std.act` standard-library module. Common types (Repo, Score,
+/// Evidence, Hash) that programs would otherwise redeclare. Parsed once and
+/// cached for the process lifetime.
+pub fn std_act() -> &'static Module {
+    static MODULE: OnceLock<Module> = OnceLock::new();
+    MODULE.get_or_init(|| {
+        parse_module(include_str!("builtin/std.act"), BUILTIN_FILE)
+            .expect("builtin std.act must parse")
+    })
+}

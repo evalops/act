@@ -480,3 +480,32 @@ task run() -> String
         .expect("selfcheck trace recorded");
     assert!(trace.field("agreement").is_some());
 }
+
+#[test]
+fn string_and_json_builtins_work() {
+    let src = r#"
+module builtins@0.1
+task run() -> Result<String, String>
+  effects []
+{
+  let s = "Hello World"
+  check s.contains("World") else { return err("contains") }
+  check s.starts_with("Hello") else { return err("starts_with") }
+  check s.ends_with("World") else { return err("ends_with") }
+  check s.to_lower() == "hello world" else { return err("to_lower") }
+  check s.to_upper() == "HELLO WORLD" else { return err("to_upper") }
+  check "  hi  ".trim() == "hi" else { return err("trim") }
+  check ["a", "b", "c"].join(", ") == "a, b, c" else { return err("join") }
+
+  let j = json_stringify({a: 1, b: "x"})
+  let parsed = json_parse(j)
+  check parsed.a == 1 else { return err("json roundtrip") }
+
+  return ok("ok")
+}
+"#;
+    let m = parse_module(src, 1).unwrap();
+    let h = MockHost::new();
+    let res = run_task(&m, "run", vec![], &cfg(&h));
+    assert!(res.is_ok(), "builtins should work: {:?}", res);
+}

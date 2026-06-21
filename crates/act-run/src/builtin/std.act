@@ -1,0 +1,19 @@
+module act.std@0.1
+
+// Common types shared across Act programs. Import with `use lib std`.
+// These are ordinary Act type declarations — no runtime, no effects.
+
+type Repo = {
+  owner: String,
+  name: String,
+}
+
+type Hash = String
+
+type Score = Decimal where 0.0 <= self <= 1.0
+
+type Evidence = {
+  source: String,
+  quote?: String,
+  observed_at: String,
+}

@@ -764,6 +764,26 @@ impl<'h> Interp<'h> {
                         _ => Value::Null,
                     });
                 }
+                "json_parse" => {
+                    let v = self.eval_arg(args, 0, env)?;
+                    return Ok(match v {
+                        Value::String(s) => {
+                            let json: serde_json::Value =
+                                serde_json::from_str(&s).map_err(|e| {
+                                    Exn::Fatal(RunError::Eval(format!("json_parse: {}", e)))
+                                })?;
+                            crate::value::value_from_json(&json)
+                        }
+                        _ => Value::Null,
+                    });
+                }
+                "json_stringify" => {
+                    let v = self.eval_arg(args, 0, env)?;
+                    return Ok(Value::String(
+                        serde_json::to_string(&crate::value::to_json(&v))
+                            .unwrap_or_else(|_| "null".to_string()),
+                    ));
+                }
                 _ => {}
             }
             // User-defined fn/proc/task.
@@ -822,6 +842,55 @@ impl<'h> Interp<'h> {
                 Value::String(s) => Value::Int(s.len() as i64),
                 _ => Value::Null,
             }),
+            "contains" => {
+                let arg = self.eval_arg(args, 0, env)?;
+                Ok(Value::Bool(match (&r, &arg) {
+                    (Value::String(s), Value::String(needle)) => s.contains(needle),
+                    (Value::Array(a), _) => a.iter().any(|e| value_eq(e, &arg)),
+                    _ => false,
+                }))
+            }
+            "starts_with" => {
+                let arg = self.eval_arg(args, 0, env)?;
+                Ok(Value::Bool(match (&r, &arg) {
+                    (Value::String(s), Value::String(prefix)) => s.starts_with(prefix),
+                    _ => false,
+                }))
+            }
+            "ends_with" => {
+                let arg = self.eval_arg(args, 0, env)?;
+                Ok(Value::Bool(match (&r, &arg) {
+                    (Value::String(s), Value::String(suffix)) => s.ends_with(suffix),
+                    _ => false,
+                }))
+            }
+            "to_lower" => Ok(match r {
+                Value::String(s) => Value::String(s.to_lowercase()),
+                _ => Value::Null,
+            }),
+            "to_upper" => Ok(match r {
+                Value::String(s) => Value::String(s.to_uppercase()),
+                _ => Value::Null,
+            }),
+            "trim" => Ok(match r {
+                Value::String(s) => Value::String(s.trim().to_string()),
+                _ => Value::Null,
+            }),
+            "join" => {
+                let sep = self.eval_arg(args, 0, env)?;
+                Ok(match (&r, &sep) {
+                    (Value::Array(a), Value::String(s)) => Value::String(
+                        a.iter()
+                            .map(|v| match v {
+                                Value::String(s) => s.clone(),
+                                other => format!("{:?}", other),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(s),
+                    ),
+                    _ => Value::Null,
+                })
+            }
             other => {
                 let _ = (args, other);
                 Err(Exn::Fatal(RunError::Eval(format!(
