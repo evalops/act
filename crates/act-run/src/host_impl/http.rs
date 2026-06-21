@@ -48,6 +48,7 @@ impl OpenAiConfig {
 pub struct HttpHost {
     openai: Option<OpenAiClient>,
     github_token: Option<String>,
+    github_api_base: String,
     state: std::sync::Mutex<HashMap<String, StateCell>>,
     traces: std::sync::Mutex<HashMap<String, Value>>,
     start: Instant,
@@ -74,6 +75,8 @@ impl HttpHost {
         HttpHost {
             openai,
             github_token: std::env::var("GITHUB_TOKEN").ok(),
+            github_api_base: std::env::var("GITHUB_API_BASE")
+                .unwrap_or_else(|_| "https://api.github.com".to_string()),
             state: std::sync::Mutex::new(HashMap::new()),
             traces: std::sync::Mutex::new(HashMap::new()),
             start: Instant::now(),
@@ -139,6 +142,9 @@ impl Host for HttpHost {
         let request = CreateChatCompletionRequestArgs::default()
             .model(&model_name)
             .messages([system, user])
+            // Request token logprobs so the accept gate has a real signal
+            // (mean chosen-token probability) instead of an always-pass placeholder.
+            .logprobs(true)
             .build()
             .map_err(|e| HostError(format!("build chat request: {}", e)))?;
         let client = setup.client.clone();
@@ -147,21 +153,37 @@ impl Host for HttpHost {
             .handle()
             .block_on(async move { client.chat().create(request).await })
             .map_err(|e| HostError(format!("model request failed: {}", e)))?;
-        let content = response
+        let choice = response
             .choices
             .into_iter()
             .next()
-            .and_then(|c| c.message.content)
-            .ok_or_else(|| HostError("model returned no content".into()))?;
+            .ok_or(HostError("model returned no choice".into()))?;
+        let content = choice
+            .message
+            .content
+            .ok_or(HostError("model returned no content".into()))?;
         let tokens = response.usage.map(|u| u.total_tokens as u64).unwrap_or(0);
+        // Confidence = geometric mean of chosen-token probabilities. This is a
+        // token-level proxy, not a calibrated answer-confidence; treat it as a
+        // coarse gate and prefer a verifier-derived score where it matters.
+        let confidence = choice
+            .logprobs
+            .and_then(|lp| lp.content)
+            .map(|tokens| {
+                if tokens.is_empty() {
+                    return 1.0;
+                }
+                let mean_logprob: f64 =
+                    tokens.iter().map(|t| t.logprob as f64).sum::<f64>() / tokens.len() as f64;
+                mean_logprob.exp()
+            })
+            .unwrap_or(1.0);
         // Parse the content as JSON; fall back to wrapping it as a string.
         let json = serde_json::from_str::<serde_json::Value>(&content)
             .unwrap_or(serde_json::Value::String(content));
         Ok(InferResult {
             json,
-            // Chat APIs don't return calibrated confidence; the accept gate
-            // should be set conservatively or use a verifier-derived score.
-            confidence: 1.0,
+            confidence,
             tokens,
             cost: 0.0,
         })
@@ -284,7 +306,7 @@ impl HttpHost {
                     "base": "main",
                     "body": text_arg(args, "body"),
                 });
-                let url = format!("https://api.github.com/repos/{}/pulls", repo_full(&repo));
+                let url = format!("{}/repos/{}/pulls", self.github_api_base, repo_full(&repo));
                 let resp = blocking_post_json(&url, &body, &headers)?;
                 let html = resp
                     .get("html_url")
@@ -300,7 +322,8 @@ impl HttpHost {
                 let repo = arg("repo").unwrap_or(Value::Null);
                 let path = text_arg(args, "path");
                 let url = format!(
-                    "https://api.github.com/repos/{}/contents/{}",
+                    "{}/repos/{}/contents/{}",
+                    self.github_api_base,
                     repo_full(&repo),
                     path
                 );
@@ -321,7 +344,8 @@ impl HttpHost {
                 let base = text_arg(args, "base");
                 let head = text_arg(args, "head");
                 let url = format!(
-                    "https://api.github.com/repos/{}/compare/{}...{}",
+                    "{}/repos/{}/compare/{}...{}",
+                    self.github_api_base,
                     repo_full(&repo),
                     base,
                     head

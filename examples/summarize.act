@@ -24,7 +24,7 @@ task summarize(repo: Repo, path: String) -> Result<Summary, String>
     goal: "Summarize this file in one sentence."
     input: content
   } accept {
-    confidence >= 0.0,
+    confidence >= 0.2,
   }
   return ok(summary)
 }

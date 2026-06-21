@@ -1,0 +1,36 @@
+module open_pr@0.1
+
+use model codegen@1 as coder
+
+type Repo = {
+  owner: String,
+  name: String,
+}
+
+type Draft = {
+  title: String,
+  body: String,
+}
+
+// Exercises the write path: drafts a PR via the model, then opens it.
+// Runnable end-to-end:
+//   OPENAI_API_KEY=... GITHUB_TOKEN=... \
+//     actc run examples/open_pr.act open_pr \
+//       repo='{"owner":"evalops","name":"act"}' branch='"agent/draft"'
+task open_pr(repo: Repo, branch: String) -> Result<String, String>
+  effects [gh.read, gh.write, model]
+{
+  let draft = infer Draft using coder {
+    goal: "Draft a one-line PR title and a short body."
+    input: branch
+  } accept {
+    confidence >= 0.2,
+  }
+  let url = try gh.create_pull_request(
+    repo: repo,
+    branch: branch,
+    title: draft.title,
+    body: draft.body,
+  )
+  return ok(url)
+}
