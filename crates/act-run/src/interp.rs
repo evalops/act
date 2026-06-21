@@ -782,13 +782,17 @@ impl<'h> Interp<'h> {
                 .map_err(|d| Exn::Fatal(RunError::Budget(d)))?;
             let evaled = self.eval_args(args, env)?;
 
-            // Runtime tools (`act.*`) are self-hosted: the interp handles them
-            // directly because they need interp recursion (a host can't borrow
-            // itself to call back in). `act.run_task` runs another Act program
-            // from source, sharing this run's host/budget/caps; traces from the
-            // sub-run land in the shared host store and are replayable here.
+            // Runtime tools (`act.*`, `actc.*`) are self-hosted: the interp
+            // handles them directly because they need interp recursion or
+            // in-process checker access (a host can't borrow itself to call
+            // back in). `act.run_task` runs another Act program from source;
+            // `actc.check` runs the Rust checker as the reference oracle.
+            // Traces from the sub-run land in the shared host store.
             if let Some(rest) = full.strip_prefix("act.") {
-                return self.runtime_tool(rest, &evaled);
+                return self.runtime_tool(rest, &evaled, "act");
+            }
+            if let Some(rest) = full.strip_prefix("actc.") {
+                return self.runtime_tool(rest, &evaled, "actc");
             }
 
             let res = self
@@ -928,9 +932,10 @@ impl<'h> Interp<'h> {
         }
     }
 
-    /// Dispatch a self-hosted `act.*` runtime tool. These are handled in the
-    /// interp (not the host) because they require interp recursion.
-    fn runtime_tool(&self, op: &str, args: &[(String, Value)]) -> Result<Value, Exn> {
+    /// Dispatch a self-hosted `act.*` / `actc.*` runtime tool. These are
+    /// handled in the interp (not the host) because they require interp
+    /// recursion or in-process checker access.
+    fn runtime_tool(&self, op: &str, args: &[(String, Value)], _ns: &str) -> Result<Value, Exn> {
         let text = |name: &str| -> Option<String> {
             args.iter()
                 .find(|(n, _)| n == name)
@@ -940,21 +945,21 @@ impl<'h> Interp<'h> {
                 })
         };
         match op {
-            // act.run_task(module_src: String, task: String, args: String) ->
+            // act.run_task(module_src: String, task_name: String, args: String) ->
             //   Result<String, String>. Runs another Act program from source
             //   against the shared host/budget/caps. The result is JSON-
             //   stringified so the caller can pass it to `infer` for scoring;
             //   traces from the sub-run are in the shared host store.
             "run_task" => {
                 let module_src = text("module_src").unwrap_or_default();
-                let task = text("task").unwrap_or_default();
+                let task_name = text("task_name").unwrap_or_default();
                 let args_json = text("args").unwrap_or_default();
                 match run_sub_task(
                     self.host,
                     self.budget,
                     self.caps,
                     &module_src,
-                    &task,
+                    &task_name,
                     &args_json,
                 ) {
                     Ok(v) => Ok(Value::Result {
@@ -970,9 +975,31 @@ impl<'h> Interp<'h> {
                     }),
                 }
             }
+            // actc.diagnose(source: String) -> Result<String, String>. Runs the
+            // Rust checker (the reference oracle) on the source and returns the
+            // diagnostics JSON. This lets an Act program inspect its own
+            // compiler's verdict on Act source.
+            "diagnose" => {
+                let source = text("source").unwrap_or_default();
+                match parse_module(&source, 0) {
+                    Ok(module) => {
+                        let out = act_check::check(&module);
+                        let json =
+                            serde_json::to_string(&out.report).unwrap_or_else(|_| "{}".to_string());
+                        Ok(Value::Result {
+                            ok: true,
+                            value: Some(Box::new(Value::String(json))),
+                        })
+                    }
+                    Err(e) => Ok(Value::Result {
+                        ok: false,
+                        value: Some(Box::new(Value::String(format!("parse: {:?}", e)))),
+                    }),
+                }
+            }
             other => Err(Exn::Fatal(RunError::Eval(format!(
-                "unknown runtime tool `act.{}`",
-                other
+                "unknown runtime tool `{}.{}",
+                _ns, other
             )))),
         }
     }

@@ -1,0 +1,53 @@
+module act.selfcheck@0.1
+
+use tool actc@1 as actc
+use model codegen@1 as judge
+
+// A simplified diagnostic, the shape the model is asked to produce.
+type Diag = {
+  code: String,
+  msg: String,
+}
+
+// A metacircular check report: the Rust oracle's diagnostics vs the model's
+// independent diagnostics, with an agreement score.
+type CheckReport = {
+  oracle_count: Int,
+  model_count: Int,
+  agreement: Decimal,
+  oracle_diags: [Diag],
+  model_diags: [Diag],
+}
+
+// Self-hosted checker harness: runs the Rust checker (the reference oracle)
+// on Act source via `actc.check`, then independently asks a model to produce
+// diagnostics for the same source. The report compares the two so we can
+// measure whether a model can replicate Act's own static guarantees — the
+// runtime checking itself. The Rust checker stays the oracle; this Act task
+// is the harness that evaluates model-based checking against it.
+task run_check(source: String) -> Result<CheckReport, String>
+  effects [actc.read, model]
+{
+  let oracle_json = try actc.diagnose(source: source)
+
+  let model_diags = infer [Diag] using judge {
+    goal: "Inspect this Act source and list static-check violations you find. For each, give a code (e.g. E_EFFECT_MISSING) and a brief message. Return an empty array if the source is clean."
+    input: source
+  }
+
+  let report = infer CheckReport using judge {
+    goal: "Compare the oracle diagnostics (JSON) against the model diagnostics. agreement is the fraction of oracle diagnostics the model also found (0.0-1.0). oracle_count and model_count are the respective lengths."
+    input: {
+      oracle_json: oracle_json,
+      model_diags: model_diags,
+    }
+  }
+
+  trace "selfcheck" {
+    oracle_count: report.oracle_count,
+    model_count: report.model_count,
+    agreement: report.agreement,
+  }
+
+  return ok(report)
+}

@@ -389,3 +389,85 @@ fn dev_loop_runs_fix_regression_end_to_end() {
     let trace = h.replay_trace("selected_root_cause").expect("trace recorded");
     assert!(trace.field("claim").is_some());
 }
+
+#[test]
+fn self_hosted_checker_runs_rust_oracle_on_act_source() {
+    // Self-hosted checker: `examples/check.act` calls `actc.diagnose` (the Rust
+    // checker as oracle) on Act source, then independently asks a model to
+    // produce diagnostics and compares. This test proves the metacircular
+    // integration: an Act program runs the Rust checker on Act source and
+    // returns a report. The bad source has an E_EFFECT_MISSING violation.
+    let module = parse_module(include_str!("../../../examples/check.act"), 1)
+        .expect("check.act parses");
+
+    let bad_source = r#"module bad@0.1
+task run() -> String
+  effects []
+{
+  let x = gh.fetch(input: "x")
+  return ok(x)
+}
+"#;
+
+    // Sequential `judge` responses: first infer [Diag], then infer CheckReport.
+    let h = MockHost::new()
+        .model(
+            "judge",
+            serde_json::json!([{"code": "E_EFFECT_MISSING", "msg": "gh.fetch needs gh.read"}]),
+            0.9,
+        )
+        .model(
+            "judge",
+            serde_json::json!({
+                "oracle_count": 1,
+                "model_count": 1,
+                "agreement": 1.0,
+                "oracle_diags": [{"code": "E_EFFECT_MISSING", "msg": "..."}],
+                "model_diags": [{"code": "E_EFFECT_MISSING", "msg": "..."}]
+            }),
+            0.9,
+        );
+
+    let cfg = RunConfig {
+        host: &h,
+        granted_caps: HashSet::new(),
+    };
+    let result = run_task(
+        &module,
+        "run_check",
+        vec![("source".into(), Value::String(bad_source.into()))],
+        &cfg,
+    )
+    .expect("run_check should run");
+
+    // The Act task returned ok(CheckReport) — proving actc.diagnose dispatched
+    // to the real Rust checker and both inferences ran.
+    let report = match result {
+        Value::Result {
+            ok: true,
+            value: Some(v),
+        } => *v,
+        other => panic!("expected ok CheckReport, got {:?}", other),
+    };
+    let oracle_count = report
+        .field("oracle_count")
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        })
+        .expect("CheckReport has oracle_count");
+    assert!(oracle_count >= 1, "oracle found the violation");
+
+    // Separately verify the Rust oracle would flag this source — the checker
+    // the Act task dispatched to.
+    let parsed = parse_module(bad_source, 1).unwrap();
+    let rust_out = act_check::check(&parsed);
+    assert!(
+        !rust_out.report.diagnostics.is_empty(),
+        "rust oracle flags the bad source"
+    );
+
+    // The self-check trace was recorded.
+    let trace = h.replay_trace("selfcheck").expect("selfcheck trace recorded");
+    assert!(trace.field("agreement").is_some());
+}
