@@ -269,3 +269,50 @@ fn capability_not_granted_is_refused() {
     // because caps gate tools, and gh IS granted.
     assert!(res.is_ok(), "granted gh should allow tool calls: {:?}", res);
 }
+
+#[test]
+fn self_eval_harness_runs_an_act_program() {
+    // The self-hosted eval harness (`examples/eval.act`) runs another Act
+    // program via `act.run_task` and scores it. This proves the runtime can
+    // evaluate itself: an Act task dispatches a sub-run through the interp's
+    // self-hosted `act.*` tool path, then scores the output with `infer`.
+    let harness = parse_module(include_str!("../../../examples/eval.act"), 1).unwrap();
+    let sub_program = r#"
+module sub@0.1
+task greet(name: String) -> Result<String, String>
+  effects []
+{
+  return ok("hello")
+}
+"#;
+    let h = MockHost::new().model(
+        "scorer",
+        serde_json::json!({"name": "greet", "passed": true, "rating": 1.0, "output": "hello"}),
+        1.0,
+    );
+    let cfg = RunConfig {
+        host: &h,
+        granted_caps: HashSet::new(),
+    };
+    let case = Value::Record(vec![
+        ("name".into(), Value::String("greet".into())),
+        ("module_src".into(), Value::String(sub_program.into())),
+        ("task_name".into(), Value::String("greet".into())),
+        ("args".into(), Value::String(r#"{"name":"world"}"#.into())),
+        ("expected".into(), Value::String("hello".into())),
+    ]);
+    let result = run_task(&harness, "eval_one", vec![("c".into(), case)], &cfg)
+        .expect("eval_one should run");
+
+    // The proc returns the CaseResult produced by the mock scorer.
+    let rating = result
+        .field("rating")
+        .and_then(|v| v.as_f64())
+        .expect("CaseResult has rating");
+    assert_eq!(rating, 1.0);
+    let passed = result
+        .field("passed")
+        .and_then(|v| v.as_bool())
+        .expect("passed");
+    assert!(passed);
+}

@@ -1,0 +1,73 @@
+module act.harness@0.1
+
+use tool act@1 as act
+use model codegen@1 as scorer
+
+// One eval case: run `task_name` from `module_src` with JSON `args`, score the
+// output against `expected`.
+type EvalCase = {
+  name: String,
+  module_src: String,
+  task_name: String,
+  args: String,
+  expected: String,
+}
+
+// The scored result of a single case.
+type CaseResult = {
+  name: String,
+  passed: Bool,
+  rating: Decimal,
+  output: String,
+}
+
+// An aggregate eval report.
+type EvalReport = {
+  cases: [CaseResult],
+  mean_rating: Decimal,
+}
+
+// Self-hosted eval harness: runs other Act programs via `act.run_task`, scores
+// each output against an expected value with a model `infer`, and aggregates a
+// mean rating. Uses the language's own uncertainty (infer), evidence (trace),
+// and parallelism (await map) to measure Act programs — the runtime evaluating
+// itself.
+task run_eval(cases: [EvalCase]) -> Result<EvalReport, String>
+  effects [act.read, act.write, model]
+{
+  let results = await map c in cases parallel 2 limit 5 {
+    eval_one(c)
+  }
+
+  let report = infer EvalReport using scorer {
+    goal: "Aggregate case results into a report. mean_rating is the mean of case ratings. passed cases have rating 1.0."
+    input: results
+  }
+
+  trace "eval" {
+    cases: results,
+  }
+
+  return ok(report)
+}
+
+// Run one case and score it. The run result (ok or err) is passed whole to the
+// scorer so failures are scored 0.0 without separate control flow.
+proc eval_one(c: EvalCase) -> CaseResult
+  effects [act.read, act.write, model]
+{
+  let run = act.run_task(
+    module_src: c.module_src,
+    task_name: c.task_name,
+    args: c.args,
+  )
+  let verdict = infer CaseResult using scorer {
+    goal: "Score the run result against the expected value. rating is 1.0 for an exact match, 0.0 for an err result, partial for close matches. passed is true when rating >= 0.9."
+    input: {
+      name: c.name,
+      run: run,
+      expected: c.expected,
+    }
+  }
+  return verdict
+}

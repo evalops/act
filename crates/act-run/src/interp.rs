@@ -9,6 +9,8 @@ use std::sync::Arc;
 use act_diagnostics::Diagnostic;
 use act_syntax::ast::*;
 
+use act_parser::parse_module;
+
 use crate::budget::{BudgetLimits, BudgetTracker};
 use crate::host::{Host, HostError, InferRequest};
 use crate::registry::{FnRegistry, TypeRegistry};
@@ -258,6 +260,56 @@ fn run_verify_task(
                 "verifier verdict missing confidence field".into(),
             ))
         })
+}
+
+/// Run an arbitrary Act task from source, sharing the caller's host/budget/caps.
+/// Used by the `act.run_task` runtime tool so Act programs (e.g. the self-eval
+/// harness) can run other Act programs. Traces recorded by the sub-run land in
+/// the shared host's store and are replayable by the caller.
+fn run_sub_task(
+    host: &dyn Host,
+    budget: &BudgetTracker,
+    caps: &HashSet<String>,
+    module_src: &str,
+    task: &str,
+    args_json: &str,
+) -> Result<Value, RunError> {
+    let module =
+        parse_module(module_src, 0).map_err(|e| RunError::Eval(format!("parse: {:?}", e)))?;
+    let types = TypeRegistry::from_module(&module);
+    let fns = FnRegistry::from_module(&module);
+    let decl = fns
+        .get(task)
+        .ok_or_else(|| RunError::Eval(format!("no task `{}` in module", task)))?;
+    let interp = Interp {
+        host,
+        budget,
+        types: &types,
+        fns: &fns,
+        caps,
+    };
+    // Parse the args JSON object into (name, Value) pairs.
+    let args: Vec<(String, Value)> = if args_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        let json: serde_json::Value = serde_json::from_str(args_json)
+            .map_err(|e| RunError::Eval(format!("args json: {}", e)))?;
+        match json {
+            serde_json::Value::Object(map) => map
+                .into_iter()
+                .map(|(k, v)| (k, crate::value::value_from_json(&v)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let mut env = Env::new();
+    bind_params(&mut env, &decl.params, &args);
+    match interp.eval_block(&decl.body.clone().unwrap_or_default(), &mut env) {
+        Ok(Tail::Some(v)) => Ok(v),
+        Ok(Tail::None) => Ok(Value::Null),
+        Err(Exn::Return(v)) | Err(Exn::Propagate(v)) => Ok(v),
+        Err(Exn::Fatal(e)) => Err(e),
+    }
 }
 
 struct Interp<'h> {
@@ -729,6 +781,16 @@ impl<'h> Interp<'h> {
                 .spend_tool_call()
                 .map_err(|d| Exn::Fatal(RunError::Budget(d)))?;
             let evaled = self.eval_args(args, env)?;
+
+            // Runtime tools (`act.*`) are self-hosted: the interp handles them
+            // directly because they need interp recursion (a host can't borrow
+            // itself to call back in). `act.run_task` runs another Act program
+            // from source, sharing this run's host/budget/caps; traces from the
+            // sub-run land in the shared host store and are replayable here.
+            if let Some(rest) = full.strip_prefix("act.") {
+                return self.runtime_tool(rest, &evaled);
+            }
+
             let res = self
                 .host
                 .call_tool(&full, evaled)
@@ -863,6 +925,55 @@ impl<'h> Interp<'h> {
                 "capability for `{}` not granted at runtime",
                 tool_path
             ))))
+        }
+    }
+
+    /// Dispatch a self-hosted `act.*` runtime tool. These are handled in the
+    /// interp (not the host) because they require interp recursion.
+    fn runtime_tool(&self, op: &str, args: &[(String, Value)]) -> Result<Value, Exn> {
+        let text = |name: &str| -> Option<String> {
+            args.iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, v)| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+        };
+        match op {
+            // act.run_task(module_src: String, task: String, args: String) ->
+            //   Result<String, String>. Runs another Act program from source
+            //   against the shared host/budget/caps. The result is JSON-
+            //   stringified so the caller can pass it to `infer` for scoring;
+            //   traces from the sub-run are in the shared host store.
+            "run_task" => {
+                let module_src = text("module_src").unwrap_or_default();
+                let task = text("task").unwrap_or_default();
+                let args_json = text("args").unwrap_or_default();
+                match run_sub_task(
+                    self.host,
+                    self.budget,
+                    self.caps,
+                    &module_src,
+                    &task,
+                    &args_json,
+                ) {
+                    Ok(v) => Ok(Value::Result {
+                        ok: true,
+                        value: Some(Box::new(Value::String(
+                            serde_json::to_string(&crate::value::to_json(&v))
+                                .unwrap_or_else(|_| "null".to_string()),
+                        ))),
+                    }),
+                    Err(e) => Ok(Value::Result {
+                        ok: false,
+                        value: Some(Box::new(Value::String(format!("{}", e)))),
+                    }),
+                }
+            }
+            other => Err(Exn::Fatal(RunError::Eval(format!(
+                "unknown runtime tool `act.{}`",
+                other
+            )))),
         }
     }
 
