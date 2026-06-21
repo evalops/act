@@ -369,8 +369,13 @@ fn dev_loop_runs_fix_regression_end_to_end() {
         ("base_sha".into(), Value::String("abc".into())),
         ("head_sha".into(), Value::String("def".into())),
     ]);
-    let result = run_task(&module, "fix_regression", vec![("input".into(), input)], &cfg)
-        .expect("fix_regression should run");
+    let result = run_task(
+        &module,
+        "fix_regression",
+        vec![("input".into(), input)],
+        &cfg,
+    )
+    .expect("fix_regression should run");
 
     // Task returned ok(FixResult).
     let fix = match result {
@@ -386,7 +391,9 @@ fn dev_loop_runs_fix_regression_end_to_end() {
     });
     assert!(pr_url.is_some(), "FixResult has pr_url: {:?}", fix);
     // The trace was recorded.
-    let trace = h.replay_trace("selected_root_cause").expect("trace recorded");
+    let trace = h
+        .replay_trace("selected_root_cause")
+        .expect("trace recorded");
     assert!(trace.field("claim").is_some());
 }
 
@@ -397,8 +404,8 @@ fn self_hosted_checker_runs_rust_oracle_on_act_source() {
     // produce diagnostics and compares. This test proves the metacircular
     // integration: an Act program runs the Rust checker on Act source and
     // returns a report. The bad source has an E_EFFECT_MISSING violation.
-    let module = parse_module(include_str!("../../../examples/check.act"), 1)
-        .expect("check.act parses");
+    let module =
+        parse_module(include_str!("../../../examples/check.act"), 1).expect("check.act parses");
 
     let bad_source = r#"module bad@0.1
 task run() -> String
@@ -468,6 +475,8 @@ task run() -> String
     );
 
     // The self-check trace was recorded.
-    let trace = h.replay_trace("selfcheck").expect("selfcheck trace recorded");
+    let trace = h
+        .replay_trace("selfcheck")
+        .expect("selfcheck trace recorded");
     assert!(trace.field("agreement").is_some());
 }
