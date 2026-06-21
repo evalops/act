@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -15,12 +16,16 @@ fn main() -> ExitCode {
         eprintln!("                                     needs OPENAI_API_KEY, GITHUB_TOKEN for real calls");
         eprintln!("  lex   <file.act>       lex only, print tokens");
         eprintln!("  repl                    interactive REPL (mock host, :help for commands)");
+        eprintln!("  lsp                     language server (stdio JSON-RPC for editors)");
         return ExitCode::from(2);
     }
     let cmd = args[1].as_str();
-    // `repl` doesn't need a file path.
+    // `repl` and `lsp` don't need a file path.
     if cmd == "repl" {
         return repl();
+    }
+    if cmd == "lsp" {
+        return lsp();
     }
     let path = match args.get(2) {
         Some(p) => PathBuf::from(p),
@@ -228,7 +233,174 @@ fn main() -> ExitCode {
     }
 }
 
-/// A minimal REPL: evaluates expressions and statements against a mock host.
+/// A minimal LSP server over stdio JSON-RPC. Handles textDocument/didOpen,
+/// textDocument/didChange, and publishes diagnostics from the Act checker.
+/// No external LSP crate — just raw JSON-RPC. Configure in VS Code with a
+/// language server entry pointing at `actc lsp`.
+fn lsp() -> ExitCode {
+    use std::io::{BufRead, Read};
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let mut docs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    loop {
+        // Read Content-Length header.
+        let mut content_length: usize = 0;
+        loop {
+            let mut line = String::new();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) | Err(_) => return ExitCode::SUCCESS,
+                _ => {}
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some(v) = trimmed.strip_prefix("Content-Length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+        if content_length == 0 {
+            continue;
+        }
+        // Read body.
+        let mut body = vec![0u8; content_length];
+        if stdin.lock().read_exact(&mut body).is_err() {
+            return ExitCode::SUCCESS;
+        }
+        let msg: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let params = msg
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let id = msg.get("id").cloned();
+
+        match method {
+            "initialize" => {
+                let result = serde_json::json!({
+                    "capabilities": {
+                        "textDocumentSync": 1, // full sync
+                        "diagnosticProvider": true,
+                    },
+                    "serverInfo": { "name": "act-lsp", "version": "0.1" }
+                });
+                send_lsp_response(&mut stdout, id.unwrap(), result);
+            }
+            "initialized" | "exit" => {
+                if method == "exit" {
+                    return ExitCode::SUCCESS;
+                }
+            }
+            "textDocument/didOpen" => {
+                let uri = params
+                    .get("textDocument")
+                    .and_then(|td| td.get("uri"))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let text = params
+                    .get("textDocument")
+                    .and_then(|td| td.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                docs.insert(uri.clone(), text.clone());
+                publish_diagnostics(&mut stdout, &uri, &text);
+            }
+            "textDocument/didChange" => {
+                let uri = params
+                    .get("textDocument")
+                    .and_then(|td| td.get("uri"))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let text = params
+                    .get("contentChanges")
+                    .and_then(|cc| cc.get(0))
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                docs.insert(uri.clone(), text.clone());
+                publish_diagnostics(&mut stdout, &uri, &text);
+            }
+            _ => {
+                // Unknown method — respond with empty result if it had an id.
+                if let Some(id) = id {
+                    send_lsp_response(&mut stdout, id, serde_json::Value::Null);
+                }
+            }
+        }
+    }
+}
+
+fn send_lsp_response(stdout: &mut impl Write, id: serde_json::Value, result: serde_json::Value) {
+    let msg = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    let body = serde_json::to_string(&msg).unwrap_or_default();
+    write!(stdout, "Content-Length: {}\r\n\r\n{}", body.len(), body).ok();
+    stdout.flush().ok();
+}
+
+fn publish_diagnostics(stdout: &mut impl Write, uri: &str, text: &str) {
+    let diags = check_for_lsp(text);
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/publishDiagnostics",
+        "params": {
+            "uri": uri,
+            "diagnostics": diags,
+        }
+    });
+    let body = serde_json::to_string(&msg).unwrap_or_default();
+    write!(stdout, "Content-Length: {}\r\n\r\n{}", body.len(), body).ok();
+    stdout.flush().ok();
+}
+
+fn check_for_lsp(text: &str) -> serde_json::Value {
+    match act_parser::parse_module(text, 1) {
+        Ok(m) => {
+            let out = act_check::check(&m);
+            let diags: Vec<serde_json::Value> = out
+                .report
+                .diagnostics
+                .iter()
+                .map(|d| {
+                    let severity = match d.severity {
+                        act_diagnostics::Severity::Error => 1,
+                        act_diagnostics::Severity::Warning => 2,
+                        act_diagnostics::Severity::Info => 3,
+                        act_diagnostics::Severity::Hint => 4,
+                    };
+                    let start = d.span.start;
+                    let end = d.span.end;
+                    serde_json::json!({
+                        "range": {
+                            "start": { "line": 0, "character": start },
+                            "end": { "line": 0, "character": end.max(start + 1) }
+                        },
+                        "severity": severity,
+                        "message": d.message,
+                        "code": d.code,
+                    })
+                })
+                .collect();
+            serde_json::Value::Array(diags)
+        }
+        Err(e) => serde_json::json!([{
+            "range": {
+                "start": { "line": 0, "character": e.span.start },
+                "end": { "line": 0, "character": e.span.end.max(e.span.start + 1) }
+            },
+            "severity": 1,
+            "message": e.message,
+        }]),
+    }
+}
+
 /// Supports `:help`, `:type <expr>`, `:check <src>`, `:load <file.act>`, and
 /// `:quit`. Everything else is wrapped in a module + task and evaluated.
 fn repl() -> ExitCode {
