@@ -123,6 +123,18 @@ impl Host for MockHost {
                 cost: c.cost,
             });
         }
+        // The self-hosted accept-gate verifier dispatches through `infer` on
+        // the `verifier` alias. Return a canned verdict (confidence 1.0) so
+        // accept gates pass under mock hosts without per-test setup — the gate
+        // only bites under a real verifier model.
+        if model == "verifier" {
+            return Ok(InferResult {
+                json: serde_json::json!({"confidence": 1.0, "reason": "mock"}),
+                confidence: 1.0,
+                tokens: 0,
+                cost: 0.0,
+            });
+        }
         // Default: echo the input back as the model output, full confidence.
         let json = match req.input {
             Some(v) => to_json(v),

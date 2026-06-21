@@ -174,6 +174,92 @@ fn bind_params(env: &mut Env, params: &[Param], args: &[(String, Value)]) {
     }
 }
 
+/// Serialize the accept-gate inputs into a `VerifyInput` record (each field a
+/// JSON string) for the self-hosted `verify` task. JSON strings keep the
+/// verifier task fully typed and independent of the caller's types.
+fn build_verify_input(
+    goal: &Option<Value>,
+    input: &Option<Value>,
+    constraints: &[Value],
+    output: &Value,
+) -> Value {
+    let json_str = |v: &Value| serde_json::to_string(&crate::value::to_json(v)).unwrap_or_default();
+    let goal_str = goal.as_ref().map(json_str).unwrap_or_default();
+    let input_str = input.as_ref().map(json_str).unwrap_or_default();
+    let constraints_arr: Vec<serde_json::Value> =
+        constraints.iter().map(crate::value::to_json).collect();
+    let constraints_str =
+        serde_json::to_string(&serde_json::Value::Array(constraints_arr)).unwrap_or_default();
+    let output_str = json_str(output);
+    Value::Record(vec![
+        ("goal".into(), Value::String(goal_str)),
+        ("input".into(), Value::String(input_str)),
+        ("constraints".into(), Value::String(constraints_str)),
+        ("output".into(), Value::String(output_str)),
+    ])
+}
+
+/// Run the self-hosted `verify` task from `builtin/verify.act` against the
+/// same host/budget/caps as the caller. Returns the verifier's confidence
+/// (0.0–1.0). Host/budget failures propagate as `Fatal`; a typed `err` from
+/// the verifier task is also fatal (the verifier could not produce a verdict).
+fn run_verify_task(
+    host: &dyn Host,
+    budget: &BudgetTracker,
+    caps: &HashSet<String>,
+    verify_input: Value,
+) -> Result<f64, Exn> {
+    let module = crate::builtin::verify_act();
+    let types = TypeRegistry::from_module(module);
+    let fns = FnRegistry::from_module(module);
+    let decl = fns.get("verify").ok_or_else(|| {
+        Exn::Fatal(RunError::Eval(
+            "builtin verify task missing from verify.act".into(),
+        ))
+    })?;
+    let interp = Interp {
+        host,
+        budget,
+        types: &types,
+        fns: &fns,
+        caps,
+    };
+    let mut env = Env::new();
+    bind_params(&mut env, &decl.params, &[("input".into(), verify_input)]);
+    let result = match interp.eval_block(&decl.body.clone().unwrap_or_default(), &mut env) {
+        Ok(Tail::Some(v)) => v,
+        Ok(Tail::None) => Value::Null,
+        Err(Exn::Return(v)) => v,
+        Err(Exn::Propagate(v)) => {
+            return Err(Exn::Fatal(RunError::Eval(format!(
+                "verifier task propagated: {:?}",
+                v
+            ))));
+        }
+        Err(e @ Exn::Fatal(_)) => return Err(e),
+    };
+    // The task returns Result<Verdict, String>; unwrap the ok payload.
+    let verdict = match result {
+        Value::Result {
+            ok: true,
+            value: Some(boxed),
+        } => *boxed,
+        _ => {
+            return Err(Exn::Fatal(RunError::Eval(
+                "verifier task returned err: no verdict".into(),
+            )));
+        }
+    };
+    verdict
+        .field("confidence")
+        .and_then(|c| c.as_f64())
+        .ok_or_else(|| {
+            Exn::Fatal(RunError::Eval(
+                "verifier verdict missing confidence field".into(),
+            ))
+        })
+}
+
 struct Interp<'h> {
     host: &'h dyn Host,
     budget: &'h BudgetTracker,
@@ -891,30 +977,19 @@ impl<'h> Interp<'h> {
         })?;
         // Accept gate: bind `confidence` and the result fields, then evaluate.
         if let Some(accept) = &spec.accept {
-            // Use the verifier for a real confidence score (second model call)
-            // instead of the token-logprob proxy. Mock hosts return 1.0 (no-op),
-            // so the gate only bites when a verifier is configured. This is
-            // the difference between "model was fluent" and "model was right".
-            let verify_req = crate::host::VerifyRequest {
-                goal: goal.as_ref(),
-                input: input.as_ref(),
-                constraints: &constraints,
-                output: &value,
-            };
-            let verify = self
-                .host
-                .verify(&model_name, verify_req)
-                .map_err(|e| Exn::Fatal(RunError::Host(e)))?;
-            self.budget
-                .spend_model(verify.tokens, verify.cost)
-                .map_err(|d| Exn::Fatal(RunError::Budget(d)))?;
-            // Use the verifier's confidence if it was a real call (tokens > 0),
-            // otherwise fall back to the logprob confidence.
-            let effective_confidence = if verify.tokens > 0 {
-                verify.confidence
-            } else {
-                res.confidence
-            };
+            // Self-hosted verifier: dispatch through the `verify` task in
+            // `builtin/verify.act` instead of a host primitive. Verification
+            // is then subject to the same budgets, effects, and traces as user
+            // code — the difference between "model was fluent" and "model was
+            // right", made auditable through the language's own `trace`/`replay`.
+            // The verifier's `infer` has no `accept` clause, so this cannot
+            // recurse. Any host/budget failure propagates as fatal (matching the
+            // previous host-`verify` semantics); mock hosts return a canned
+            // verdict (confidence 1.0), so the gate only bites under a real
+            // verifier model.
+            let verify_input = build_verify_input(&goal, &input, &constraints, &value);
+            let verified = run_verify_task(self.host, self.budget, self.caps, verify_input)?;
+            let effective_confidence = verified;
             let mut env2 = env.clone();
             env2.push();
             env2.bind(

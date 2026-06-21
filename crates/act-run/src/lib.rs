@@ -9,6 +9,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod budget;
+pub mod builtin;
 pub mod host;
 pub mod host_impl;
 pub mod interp;

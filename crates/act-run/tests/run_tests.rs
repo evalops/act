@@ -155,6 +155,36 @@ fn trace_is_recorded_and_replayable() {
 }
 
 #[test]
+fn self_hosted_verifier_records_auditable_trace() {
+    // The accept gate dispatches through the builtin `verify` task (an Act
+    // program), not a host primitive. That task records a `trace "verifier"`
+    // checkpoint, so verification is auditable through the language's own
+    // trace/replay — the central thesis of self-hosting the verifier.
+    let m = module();
+    let h = host();
+    run_task(
+        &m,
+        "run",
+        vec![("input".into(), Value::String("x".into()))],
+        &cfg(&h),
+    )
+    .unwrap();
+
+    let traced = h.replay_trace("verifier").expect("verifier trace recorded");
+    // The mock verifier returns confidence 1.0; the trace must carry it.
+    let confidence = traced
+        .field("confidence")
+        .and_then(|v| v.as_f64())
+        .expect("verifier trace has confidence");
+    assert_eq!(confidence, 1.0);
+    let reason = traced.field("reason").expect("verifier trace has reason");
+    match reason {
+        Value::String(s) => assert_eq!(s, "mock"),
+        other => panic!("expected mock reason string, got {:?}", other),
+    }
+}
+
+#[test]
 fn state_version_advances() {
     let m = module();
     let h = host();

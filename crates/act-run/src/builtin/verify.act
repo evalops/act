@@ -1,0 +1,48 @@
+module act.verify@0.1
+
+use model codegen@1 as verifier
+
+// The verdict returned by the accept-gate verifier.
+type Verdict = {
+  confidence: Decimal,
+  reason: String,
+}
+
+// The inputs the interpreter serializes for every `infer ... accept { ... }`
+// gate. Each field is a JSON string so the verifier task is fully typed and
+// self-contained: it does not depend on the caller's types.
+type VerifyInput = {
+  goal: String,
+  input: String,
+  constraints: String,
+  output: String,
+}
+
+// The accept-gate verifier, self-hosted as an ordinary Act task.
+//
+// The interpreter dispatches every accept gate through this task instead of a
+// host primitive, so verification is subject to the same budgets, effects,
+// and traces as user code. The `trace "verifier"` checkpoint makes the
+// verification auditable and replayable through the language's own evidence
+// mechanism.
+//
+// This task's `infer` deliberately has NO `accept` clause; the verifier is
+// trusted as the terminal confidence signal (an accept gate here would
+// recurse infinitely).
+task verify(input: VerifyInput) -> Result<Verdict, String>
+  effects [model]
+{
+  let verdict = infer Verdict using verifier {
+    goal: "Evaluate whether the candidate output correctly satisfies the goal given the input. Respond with a confidence between 0.0 and 1.0 and a brief reason."
+    input: input
+    constraints: [
+      "Confidence is 0.0-1.0 where 1.0 means certainly correct.",
+      "Reason briefly cites what was checked.",
+    ]
+  }
+  trace "verifier" {
+    confidence: verdict.confidence,
+    reason: verdict.reason,
+  }
+  return ok(verdict)
+}

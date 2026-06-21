@@ -17,9 +17,7 @@ use async_openai::{
     Client,
 };
 
-use crate::host::{
-    Host, HostError, InferRequest, InferResult, StateCell, ToolResult, VerifyRequest, VerifyResult,
-};
+use crate::host::{Host, HostError, InferRequest, InferResult, StateCell, ToolResult};
 use crate::value::{to_json, Value};
 
 /// Per-token cost in USD for cost tracking. Micros per token.
@@ -132,31 +130,6 @@ impl HttpHost {
         s.push_str("Respond with valid JSON only.");
         s
     }
-
-    /// Build a verify prompt: the verifier sees the goal, input, and the
-    /// candidate output, and must return { "confidence": 0.0-1.0, "reason": "..." }.
-    fn verify_prompt(&self, req: &VerifyRequest) -> String {
-        let mut s = String::new();
-        if let Some(g) = req.goal {
-            s.push_str("Goal: ");
-            s.push_str(&json_to_text(g));
-            s.push('\n');
-        }
-        if let Some(i) = req.input {
-            s.push_str("Input: ");
-            s.push_str(&serde_json::to_string_pretty(&to_json(i)).unwrap_or_default());
-            s.push('\n');
-        }
-        for c in req.constraints {
-            s.push_str("- ");
-            s.push_str(&json_to_text(c));
-            s.push('\n');
-        }
-        s.push_str("Candidate output to verify:\n");
-        s.push_str(&serde_json::to_string_pretty(&to_json(req.output)).unwrap_or_default());
-        s.push_str("\n\nEvaluate whether the candidate output correctly satisfies the goal given the input. Respond with JSON: { \"confidence\": <0.0-1.0>, \"reason\": \"<brief explanation>\" }");
-        s
-    }
 }
 
 fn json_to_text(v: &Value) -> String {
@@ -234,8 +207,17 @@ impl Host for HttpHost {
             .openai
             .as_ref()
             .ok_or_else(|| HostError("no model credentials: OPENAI_API_KEY unset".into()))?;
-        let _ = model;
-        let model_name = setup.model.clone();
+        // The Act `using <alias>` handle is a source-level handle, not a model
+        // ID. The concrete model comes from OPENAI_MODEL — except the verifier
+        // alias, which routes to OPENAI_VERIFIER_MODEL so the self-hosted
+        // accept-gate verifier (an ordinary `infer` in `builtin/verify.act`)
+        // can use a separate model. (A future `extern model` registry could
+        // resolve arbitrary aliases; until then sending an alias would 400.)
+        let model_name = if model == "verifier" {
+            setup.verifier_model.clone()
+        } else {
+            setup.model.clone()
+        };
         let prompt = self.prompt(&req);
         let system = ChatCompletionRequestSystemMessageArgs::default()
             .content("You are a structured-output agent. Always respond with JSON only.")
@@ -303,78 +285,6 @@ impl Host for HttpHost {
         let cost = cost_for_tokens(setup.cost_per_1k_tokens_micros, tokens);
         Ok(InferResult {
             json,
-            confidence,
-            tokens,
-            cost,
-        })
-    }
-
-    fn verify(&self, model: &str, req: VerifyRequest) -> Result<VerifyResult, HostError> {
-        let setup = self
-            .openai
-            .as_ref()
-            .ok_or_else(|| HostError("no model credentials: OPENAI_API_KEY unset".into()))?;
-        let _ = model;
-        let model_name = setup.verifier_model.clone();
-        let prompt = self.verify_prompt(&req);
-        let system = ChatCompletionRequestSystemMessageArgs::default()
-            .content("You are a verification agent. Evaluate the candidate output and respond with JSON only.")
-            .build()
-            .map_err(|e| HostError(format!("build verify system message: {}", e)))?
-            .into();
-        let user = ChatCompletionRequestUserMessageArgs::default()
-            .content(prompt)
-            .build()
-            .map_err(|e| HostError(format!("build verify user message: {}", e)))?
-            .into();
-        // The verifier always returns { "confidence": number, "reason": string }.
-        let verifier_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "confidence": {"type": "number"},
-                "reason": {"type": "string"}
-            },
-            "required": ["confidence", "reason"],
-            "additionalProperties": false
-        });
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(&model_name)
-            .messages([system, user])
-            .response_format(ResponseFormat::JsonSchema {
-                json_schema: ResponseFormatJsonSchema {
-                    name: "act_verify_output".to_string(),
-                    description: None,
-                    schema: Some(verifier_schema),
-                    strict: Some(true),
-                },
-            })
-            .build()
-            .map_err(|e| HostError(format!("build verify request: {}", e)))?;
-        let client = setup.client.clone();
-        let response = setup
-            .rt
-            .handle()
-            .block_on(async move { client.chat().create(request).await })
-            .map_err(|e| HostError(format!("verify request failed: {}", e)))?;
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or(HostError("verifier returned no choice".into()))?;
-        let content = choice
-            .message
-            .content
-            .ok_or(HostError("verifier returned no content".into()))?;
-        let tokens = response.usage.map(|u| u.total_tokens as u64).unwrap_or(0);
-        let parsed: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| HostError(format!("verifier returned non-JSON: {}", e)))?;
-        let confidence = parsed
-            .get("confidence")
-            .and_then(|c| c.as_f64())
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0);
-        let cost = cost_for_tokens(setup.cost_per_1k_tokens_micros, tokens);
-        Ok(VerifyResult {
             confidence,
             tokens,
             cost,
