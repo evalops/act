@@ -10,12 +10,18 @@ fn main() -> ExitCode {
         eprintln!("  parse <file.act>       parse only, print AST summary");
         eprintln!("  lower <file.act>       parse + check + lower to graph IR, print JSON");
         eprintln!("  fmt   <file.act>       parse + format to canonical source");
-        eprintln!("  run   <file.act> <task> [name=json ...]  parse + check + execute against");
-        eprintln!("                                     real models/tools (needs OPENAI_API_KEY, GITHUB_TOKEN)");
+        eprintln!("  run   <file.act> <task> [name=json ...]  parse + check + execute");
+        eprintln!("                                     also: --args-json '{{\"k\":v}}' or --args-file f.json");
+        eprintln!("                                     needs OPENAI_API_KEY, GITHUB_TOKEN for real calls");
         eprintln!("  lex   <file.act>       lex only, print tokens");
+        eprintln!("  repl                    interactive REPL (mock host, :help for commands)");
         return ExitCode::from(2);
     }
     let cmd = args[1].as_str();
+    // `repl` doesn't need a file path.
+    if cmd == "repl" {
+        return repl();
+    }
     let path = match args.get(2) {
         Some(p) => PathBuf::from(p),
         None => {
@@ -123,6 +129,8 @@ fn main() -> ExitCode {
                 Some(t) => t.clone(),
                 None => {
                     eprintln!("usage: actc run <file.act> <task> [name=json ...]");
+                    eprintln!("       actc run <file.act> <task> --args-json '{{\"k\":v}}'");
+                    eprintln!("       actc run <file.act> <task> --args-file args.json");
                     return ExitCode::from(2);
                 }
             };
@@ -138,9 +146,49 @@ fn main() -> ExitCode {
                 println!("{}", serde_json::to_string_pretty(&chk.report).unwrap());
                 return ExitCode::from(1);
             }
-            // Remaining args are `name=json` pairs bound to task params.
+            // Parse args from: --args-json '{...}', --args-file path, or
+            // positional name=json pairs.
             let mut run_args: Vec<(String, act_run::Value)> = Vec::new();
-            for a in args.iter().skip(4) {
+            let mut i = 4;
+            while i < args.len() {
+                let a = &args[i];
+                if a == "--args-json" {
+                    if let Some(json_str) = args.get(i + 1) {
+                        let json: serde_json::Value = serde_json::from_str(json_str)
+                            .unwrap_or_else(|e| {
+                                eprintln!("error: --args-json is not valid JSON: {}", e);
+                                std::process::exit(2);
+                            });
+                        if let serde_json::Value::Object(map) = json {
+                            for (k, v) in map {
+                                run_args.push((k.clone(), act_run::value_from_json(&v)));
+                            }
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
+                if a == "--args-file" {
+                    if let Some(file_path) = args.get(i + 1) {
+                        let file_content = std::fs::read_to_string(file_path).unwrap_or_else(|e| {
+                            eprintln!("error: cannot read args file: {}", e);
+                            std::process::exit(2);
+                        });
+                        let json: serde_json::Value = serde_json::from_str(&file_content)
+                            .unwrap_or_else(|e| {
+                                eprintln!("error: args file is not valid JSON: {}", e);
+                                std::process::exit(2);
+                            });
+                        if let serde_json::Value::Object(map) = json {
+                            for (k, v) in map {
+                                run_args.push((k.clone(), act_run::value_from_json(&v)));
+                            }
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
+                // Positional name=json pair.
                 match a.split_once('=') {
                     Some((k, v)) => {
                         let json: serde_json::Value = serde_json::from_str(v)
@@ -152,6 +200,7 @@ fn main() -> ExitCode {
                         run_args.push((a.clone(), act_run::Value::String(a.clone())));
                     }
                 }
+                i += 1;
             }
             let host = act_run::HttpHost::from_env();
             let cfg = act_run::RunConfig {
@@ -176,6 +225,127 @@ fn main() -> ExitCode {
             eprintln!("unknown command: {}", other);
             ExitCode::from(2)
         }
+    }
+}
+
+/// A minimal REPL: evaluates expressions and statements against a mock host.
+/// Supports `:help`, `:type <expr>`, `:check <src>`, `:load <file.act>`, and
+/// `:quit`. Everything else is wrapped in a module + task and evaluated.
+fn repl() -> ExitCode {
+    use std::io::{BufRead, Write};
+    let host = act_run::MockHost::new();
+    let cfg = act_run::RunConfig {
+        host: &host,
+        granted_caps: std::collections::HashSet::new(),
+    };
+    let stdin = std::io::stdin();
+    let mut lines: Vec<String> = Vec::new();
+    println!("act repl — type :help for commands, :quit to exit");
+    loop {
+        let prompt = if lines.is_empty() { "act> " } else { "...> " };
+        print!("{}", prompt);
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            _ => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !lines.is_empty() {
+            lines.push(line.clone());
+            if trimmed.ends_with('}') || trimmed.ends_with(')') {
+                let src = lines.join("\n");
+                eval_repl_input(&src, &cfg);
+                lines.clear();
+            }
+            continue;
+        }
+        match trimmed {
+            ":quit" | ":q" => break,
+            ":help" | ":h" => {
+                println!("  :help          show this help");
+                println!("  :quit          exit");
+                println!("  :check <src>   parse + check an Act source snippet");
+                println!("  :load <file>   load and check an Act file");
+                println!("  <expr>         evaluate an expression (wrapped in a task)");
+                println!("  multi-line: start with `{{` or `(` to continue on next lines");
+            }
+            _ if trimmed.starts_with(":check ") => {
+                let src = &trimmed[7..];
+                check_snippet(src);
+            }
+            _ if trimmed.starts_with(":load ") => {
+                let path = trimmed[6..].trim();
+                match std::fs::read_to_string(path) {
+                    Ok(src) => check_snippet(&src),
+                    Err(e) => eprintln!("error: {}", e),
+                }
+            }
+            _ => {
+                eval_repl_input(trimmed, &cfg);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn check_snippet(src: &str) {
+    let full = format!("module repl@0.1\n{}", src);
+    match act_parser::parse_module(&full, 1) {
+        Ok(m) => {
+            let out = act_check::check(&m);
+            if out.report.ok {
+                println!("ok");
+            } else {
+                for d in &out.report.diagnostics {
+                    println!("  {:?} {}", d.severity, d.message);
+                }
+            }
+        }
+        Err(e) => eprintln!("parse error: {}", e.message),
+    }
+}
+
+fn eval_repl_input(input: &str, cfg: &act_run::RunConfig) {
+    // Wrap the input in a task and evaluate it against the mock host.
+    let src = format!(
+        "module repl@0.1\ntask repl() -> Result<String, String>\n  effects []\n{{\n  return ok(json_stringify({}))\n}}",
+        input
+    );
+    match act_parser::parse_module(&src, 1) {
+        Ok(m) => {
+            let chk = act_check::check(&m);
+            if !chk.report.ok {
+                for d in &chk.report.diagnostics {
+                    eprintln!("  {:?} {}", d.severity, d.message);
+                }
+                return;
+            }
+            match act_run::run_task(&m, "repl", vec![], cfg) {
+                Ok(v) => match v {
+                    act_run::Value::Result {
+                        ok: true,
+                        value: Some(boxed),
+                    } => match *boxed {
+                        act_run::Value::String(s) => println!("{}", s),
+                        other => println!("{:?}", other),
+                    },
+                    act_run::Value::Result {
+                        ok: false,
+                        value: Some(boxed),
+                    } => match *boxed {
+                        act_run::Value::String(s) => eprintln!("err: {}", s),
+                        other => eprintln!("err: {:?}", other),
+                    },
+                    other => println!("{:?}", other),
+                },
+                Err(e) => eprintln!("runtime error: {}", e),
+            }
+        }
+        Err(e) => eprintln!("parse error: {}", e.message),
     }
 }
 
