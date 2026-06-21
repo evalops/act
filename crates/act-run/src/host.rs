@@ -20,6 +20,10 @@ pub struct InferRequest<'a> {
     pub goal: Option<&'a Value>,
     pub input: Option<&'a Value>,
     pub constraints: &'a [Value],
+    /// A compact rendering of the target type (e.g. `{ text: String }`),
+    /// so the host can tell the model what shape to return. `None` for
+    /// mock/test hosts that don't need it.
+    pub ty_schema: Option<&'a str>,
 }
 
 /// A model's response, before type-directed coercion.

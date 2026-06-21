@@ -103,7 +103,13 @@ impl HttpHost {
                 s.push('\n');
             }
         }
-        s.push_str("Respond with only valid JSON for the requested type.");
+        if let Some(schema) = req.ty_schema {
+            s.push_str("Respond with only valid JSON matching this shape: ");
+            s.push_str(schema);
+            s.push('\n');
+        } else {
+            s.push_str("Respond with only valid JSON for the requested type.");
+        }
         s
     }
 }
@@ -121,13 +127,12 @@ impl Host for HttpHost {
             .openai
             .as_ref()
             .ok_or_else(|| HostError("no model credentials: OPENAI_API_KEY unset".into()))?;
-        // The Act `using <alias>` handle is not a real model name; the concrete
-        // model comes from OPENAI_MODEL (unless the source names one explicitly).
-        let model_name = if model.is_empty() {
-            setup.model.clone()
-        } else {
-            model.to_string()
-        };
+        // The Act `using <alias>` handle is a source-level handle, not a model
+        // ID. The concrete model always comes from OPENAI_MODEL. (A future
+        // `extern model` registry could resolve aliases to real IDs; until then
+        // sending the alias would 400 against any real provider.)
+        let _ = model;
+        let model_name = setup.model.clone();
         let prompt = self.prompt(&req);
         let system = ChatCompletionRequestSystemMessageArgs::default()
             .content("You are a structured-output agent. Always respond with JSON only.")

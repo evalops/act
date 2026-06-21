@@ -869,10 +869,12 @@ impl<'h> Interp<'h> {
         for c in &spec.constraints {
             constraints.push(self.eval_expr(c, env)?);
         }
+        let schema = render_ty(&ty.node, self.types);
         let req = InferRequest {
             goal: goal.as_ref(),
             input: input.as_ref(),
             constraints: &constraints,
+            ty_schema: Some(&schema),
         };
         let res = self
             .host
@@ -1005,6 +1007,85 @@ fn path_string(p: &[Ident]) -> String {
         .map(|i| i.node.as_str())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Render a type into a compact schema string for the model prompt, so the
+/// model knows what JSON shape to return (e.g. `{ text: String }`).
+/// Resolves named record/enum types via the registry.
+fn render_ty(ty: &Ty, types: &TypeRegistry) -> String {
+    match ty {
+        Ty::Named { path, args } => {
+            let name = path.last().map(|i| i.node.as_str()).unwrap_or("");
+            match name {
+                "String" => "String".to_string(),
+                "Int" => "Int".to_string(),
+                "Decimal" => "Decimal".to_string(),
+                "Bool" => "Bool".to_string(),
+                "Secret" if !args.is_empty() => render_ty(&args[0].node, types),
+                "Result" if args.len() == 2 => {
+                    format!(
+                        "{{\"ok\": {}}} or {{\"err\": {}}}",
+                        render_ty(&args[0].node, types),
+                        render_ty(&args[1].node, types)
+                    )
+                }
+                other => match types.get(other) {
+                    Some(decl) => render_decl(decl, types),
+                    None => other.to_string(),
+                },
+            }
+        }
+        Ty::Array(inner) => format!("[{}]", render_ty(&inner.node, types)),
+        Ty::Tuple(elems) => format!(
+            "[{}]",
+            elems
+                .iter()
+                .map(|t| render_ty(&t.node, types))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => "JSON".to_string(),
+    }
+}
+
+fn render_decl(decl: &act_syntax::ast::TypeDecl, types: &TypeRegistry) -> String {
+    use act_syntax::ast::TypeBody;
+    match &decl.body {
+        TypeBody::Record(fields) => {
+            let fs: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    let opt = if f.optional { "?" } else { "" };
+                    format!("{}{}: {}", f.name.node, opt, render_ty(&f.ty.node, types))
+                })
+                .collect();
+            format!("{{ {} }}", fs.join(", "))
+        }
+        TypeBody::Enum(variants) => {
+            let vs: Vec<String> = variants
+                .iter()
+                .map(|v| {
+                    if v.fields.is_empty() {
+                        format!("\"{}\"", v.name.node)
+                    } else {
+                        let fs: Vec<String> = v
+                            .fields
+                            .iter()
+                            .map(|(n, t)| {
+                                let nm = n.as_ref().map(|i| i.node.as_str()).unwrap_or("value");
+                                format!("{}: {}", nm, render_ty(&t.node, types))
+                            })
+                            .collect();
+                        format!("{{\"{}\": {{ {} }}}}", v.name.node, fs.join(", "))
+                    }
+                })
+                .collect();
+            vs.join(" or ")
+        }
+        TypeBody::Alias(inner) => render_ty(&inner.node, types),
+        TypeBody::Refinement { ty, .. } => render_ty(&ty.node, types),
+        TypeBody::Opaque => decl.name.node.clone(),
+    }
 }
 
 fn eval_binop(op: BinOp, l: &Value, r: &Value) -> Value {
