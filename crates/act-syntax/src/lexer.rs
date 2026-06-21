@@ -198,6 +198,61 @@ pub enum TokenKind {
     KwEvidence,
 }
 
+impl TokenKind {
+    /// True if this token kind is any keyword. Keywords are usable as
+    /// identifiers in positions where the parser expects an identifier (field
+    /// names, param names, let bindings) — the parser's grammar context
+    /// disambiguates. See `Parser::ident`.
+    pub fn is_keyword(&self) -> bool {
+        !matches!(
+            self,
+            TokenKind::LParen
+                | TokenKind::RParen
+                | TokenKind::LBrace
+                | TokenKind::RBrace
+                | TokenKind::LBracket
+                | TokenKind::RBracket
+                | TokenKind::Comma
+                | TokenKind::Colon
+                | TokenKind::Semicolon
+                | TokenKind::Dot
+                | TokenKind::DotDot
+                | TokenKind::Arrow
+                | TokenKind::FatArrow
+                | TokenKind::Pipe
+                | TokenKind::Backslash
+                | TokenKind::Question
+                | TokenKind::QuestionQuestion
+                | TokenKind::At
+                | TokenKind::Underscore
+                | TokenKind::Eq
+                | TokenKind::EqEq
+                | TokenKind::BangEq
+                | TokenKind::Lt
+                | TokenKind::Le
+                | TokenKind::Gt
+                | TokenKind::Ge
+                | TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Star
+                | TokenKind::Slash
+                | TokenKind::Percent
+                | TokenKind::AmpAmp
+                | TokenKind::PipePipe
+                | TokenKind::Bang
+                | TokenKind::LeEq
+                | TokenKind::PipeGt
+                | TokenKind::Int
+                | TokenKind::Decimal
+                | TokenKind::String
+                | TokenKind::Duration
+                | TokenKind::Money
+                | TokenKind::Ident
+                | TokenKind::ShebangLine
+        )
+    }
+}
+
 impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)

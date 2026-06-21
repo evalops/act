@@ -228,3 +228,37 @@ eval "e" {
     });
     assert!(eval.is_some(), "eval block should parse");
 }
+
+#[test]
+fn keywords_usable_as_field_and_param_names() {
+    // Keywords like `score`, `check`, `task`, `run`, `input`, `goal` should be
+    // usable as field names and parameter names — the parser's grammar context
+    // disambiguates them from keyword usage.
+    let m = parse(
+        r#"
+module test@0.1
+type R = {
+  score: Decimal,
+  check: Bool,
+  task: String,
+  run: String,
+  input: String,
+  goal: String,
+  trace: String,
+  match: String,
+}
+fn f(score: Int, check: Bool, task: String) -> Int {
+  score
+}
+task t(check: Bool) -> Result<Int, String>
+  effects []
+{
+  let run = 42
+  return ok(run)
+}
+"#,
+    );
+    // Should parse without error (parse() panics on error).
+    let has_type = m.items.iter().any(|i| matches!(i, Item::TypeDecl(_)));
+    assert!(has_type, "type decl should parse");
+}

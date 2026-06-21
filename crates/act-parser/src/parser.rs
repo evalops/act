@@ -17,34 +17,6 @@ pub struct ParseError {
 /// Keywords that are also acceptable as identifiers in name positions
 /// (variant names, field names, etc.). This avoids forcing users to
 /// escape common words like `ok`, `err`, `value`, `confidence`.
-fn is_soft_keyword(k: TokenKind) -> bool {
-    matches!(
-        k,
-        TokenKind::KwOk
-            | TokenKind::KwErr
-            | TokenKind::KwSome
-            | TokenKind::KwNone
-            | TokenKind::KwValue
-            | TokenKind::KwConfidence
-            | TokenKind::KwEvidence
-            | TokenKind::KwInput
-            | TokenKind::KwGoal
-            | TokenKind::KwChoices
-            | TokenKind::KwConstraints
-            | TokenKind::KwRubric
-            | TokenKind::KwValidate
-            | TokenKind::KwAccept
-            | TokenKind::KwTest
-            | TokenKind::KwEval
-            | TokenKind::KwModel
-            | TokenKind::KwMessage
-            | TokenKind::KwEvent
-            | TokenKind::KwOn
-            | TokenKind::KwTool
-            | TokenKind::KwLib
-    )
-}
-
 /// Allows span_from to accept either lexer spans or AST spans.
 trait SpanLike {
     fn to_lex(self) -> LexSpan;
@@ -113,7 +85,7 @@ impl Parser {
     /// keyword immediately followed by `:`. Used for call args (`name: value`)
     /// and record fields, so soft keywords like `value` work as names.
     fn at_named_label(&self) -> bool {
-        let is_name = self.at(TokenKind::Ident) || self.peek_kind().is_some_and(is_soft_keyword);
+        let is_name = self.at(TokenKind::Ident) || self.peek_kind().is_some_and(|k| k.is_keyword());
         is_name && self.peek2().map(|t| t.kind) == Some(TokenKind::Colon)
     }
 
@@ -150,7 +122,7 @@ impl Parser {
     fn ident(&mut self) -> ParseResult<Ident> {
         let t = match self.peek_kind() {
             Some(TokenKind::Ident) => self.bump().unwrap(),
-            Some(k) if is_soft_keyword(k) => self.bump().unwrap(),
+            Some(k) if k.is_keyword() => self.bump().unwrap(),
             _ => {
                 return Err(ParseError {
                     span: self.peek().map(|t| t.span).unwrap_or_else(LexSpan::dummy),
@@ -455,7 +427,7 @@ impl Parser {
                         loop {
                             let name = if self
                                 .peek_kind()
-                                .map(|k| k == TokenKind::Ident || is_soft_keyword(k))
+                                .map(|k| k == TokenKind::Ident || k.is_keyword())
                                 .unwrap_or(false)
                                 && self.peek2().map(|t| t.kind) == Some(TokenKind::Colon)
                             {
@@ -1736,7 +1708,7 @@ impl Parser {
                 let end = self.expect(TokenKind::RBracket, "`]`")?.span;
                 Ok(Spanned::new(self.span_from(start, end), Expr::Array(elems)))
             }
-            Some(k) if k == TokenKind::Ident || is_soft_keyword(k) => {
+            Some(k) if k == TokenKind::Ident || k.is_keyword() => {
                 let path = self.path()?;
                 let span = self.span_from(start, self.peek().map(|t| t.span).unwrap_or(start));
                 Ok(Spanned::new(span, Expr::Path(path)))

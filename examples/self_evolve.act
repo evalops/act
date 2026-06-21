@@ -18,7 +18,7 @@ type Candidate = {
   source: String,
   task_name: String,
   rationale: String,
-  self_rating: Score,
+  self_score: Score,
 }
 
 // The verdict from the self-hosted checker (Rust oracle) on a candidate.
@@ -36,14 +36,14 @@ type RunVerdict = {
 // A fully evaluated candidate: check + run + final rating.
 type EvalVerdict = {
   candidate: Candidate,
-  checker: CheckVerdict,
-  runner: RunVerdict,
-  rating: Score,
+  check: CheckVerdict,
+  run: RunVerdict,
+  score: Score,
 }
 
 type SelfEvolveResult = {
   best: Candidate,
-  rating: Score,
+  score: Score,
   pr_url: String,
 }
 
@@ -100,7 +100,7 @@ task self_evolve(repo: Repo, goal: String) -> Result<SelfEvolveResult, SelfEvolv
         "Return valid Act source in the `source` field.",
         "Name the entry task in `task_name`.",
         "Explain the approach in `rationale`.",
-        "self_rating is your confidence 0.0-1.0.",
+        "self_score is your confidence 0.0-1.0.",
       ]
     } accept {
       confidence >= 0.6,
@@ -132,14 +132,14 @@ task self_evolve(repo: Repo, goal: String) -> Result<SelfEvolveResult, SelfEvolv
   // Decide the best by weighted rating (correctness first, then self-confidence).
   let best = decide EvalVerdict from evals
     score by [
-      0.7: rating desc,
-      0.3: candidate.self_rating desc,
+      0.7: score desc,
+      0.3: candidate.self_score desc,
     ]
-    accept rating >= 0.5
-    else return err(no_candidate("no candidate cleared the rating threshold"))
+    accept score >= 0.5
+    else return err(no_candidate("no candidate cleared the score threshold"))
 
-  check best.rating >= 0.7 else {
-    return err(no_candidate("best rating below 0.7"))
+  check best.score >= 0.7 else {
+    return err(no_candidate("best score below 0.7"))
   }
 
   // Open a PR with the winning program. Compensate by closing if anything
@@ -159,14 +159,14 @@ task self_evolve(repo: Repo, goal: String) -> Result<SelfEvolveResult, SelfEvolv
   trace "self_evolve" {
     goal: goal,
     best_source: best.candidate.source,
-    best_rating: best.rating,
-    check_diagnostics: best.checker.diagnostics,
-    run_output: best.runner.output,
+    best_score: best.score,
+    check_diagnostics: best.check.diagnostics,
+    run_output: best.run.output,
   }
 
   return ok({
     best: best.candidate,
-    rating: best.rating,
+    rating: best.score,
     pr_url: pr,
   })
 }
@@ -179,9 +179,9 @@ proc evaluate(c: Candidate) -> EvalVerdict
 {
   // Self-hosted checker: Act runs the Rust checker on Act source.
   let diag_json = try actc.diagnose(source: c.source)
-  let checker = infer CheckVerdict using coder {
+  let check = infer CheckVerdict using coder {
     goal: "Interpret the checker diagnostics JSON. ok is true if there are no Error-severity diagnostics."
-    input: diag_json
+    input: check
   }
 
   // Self-hosted runtime: Act runs the candidate Act program. If it doesn't
@@ -191,18 +191,18 @@ proc evaluate(c: Candidate) -> EvalVerdict
     task_name: c.task_name,
     args: "{}",
   )
-  let runner = infer RunVerdict using coder {
+  let run = infer RunVerdict using coder {
     goal: "Interpret the run result. ok is true if the result is ok(...)."
     input: run
   }
 
   // Final rating combines check + run + self-confidence.
-  let final = infer Score using coder {
+  let score = infer Score using coder {
     goal: "Rate this candidate 0.0-1.0. 1.0 if it checks clean AND runs ok AND addresses the goal. 0.0 if it fails to check or run."
     input: {
       candidate: c,
-      checker: checker,
-      runner: runner,
+      check: checker,
+      run: runner,
     }
   } accept {
     confidence >= 0.5,
@@ -210,9 +210,9 @@ proc evaluate(c: Candidate) -> EvalVerdict
 
   return {
     candidate: c,
-    checker: checker,
-    runner: runner,
-    rating: final,
+    check: checker,
+    run: runner,
+    score: score,
   }
 }
 
@@ -220,5 +220,5 @@ proc evaluate(c: Candidate) -> EvalVerdict
 // An eval harness or postmortem drives this to reconstruct the decision.
 eval "replay_self_evolve" {
   let t = replay trace("self_evolve")
-  require t.best_rating >= 0.7
+  require t.best_score >= 0.7
 }
